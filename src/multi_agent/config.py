@@ -39,6 +39,12 @@ class MultiAgentConfig:
 
     agent_roles: dict[str, str] | None = None
 
+    # TGN extension (all default to safe no-op values)
+    use_tgn: bool = False
+    tgn_memory_dim: int = 128
+    tgn_time_dim: int = 32
+    tgn_n_attn_heads: int = 4
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MultiAgentConfig":
 
