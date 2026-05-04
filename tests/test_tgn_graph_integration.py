@@ -154,3 +154,81 @@ def test_graph_tgn_z_tensor_cache_invalidated_after_extend():
     # New edge must invalidate it
     g.extend([], np.empty((0, 16), dtype=np.float32), [("a", "b", 0.8)])
     assert g._z_tensor is None
+
+
+def test_psro_step_completes_with_tgn_attached():
+    """Full PSROLoop.step() runs without error when TGN is attached to Graph."""
+    from multi_agent.graph import Graph
+    from multi_agent.tgn import TGNModule
+    from multi_agent.config import MultiAgentConfig
+    from multi_agent.agent import AgentPopulation
+    from multi_agent.psro import PSROLoop
+    from multi_agent.judge import StaticJudge
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    emb_dim = 16
+    n_nodes = 6
+    embs = np.random.randn(n_nodes, emb_dim).astype(np.float32)
+    node_ids = [f"n{i}" for i in range(n_nodes)]
+
+    tgn = TGNModule(emb_dim=emb_dim, memory_dim=16, time_dim=8, n_heads=2)
+    graph = Graph(emb_dim=emb_dim)
+    graph._tgn = tgn
+    graph.extend(node_ids, embs, [])
+
+    config = MultiAgentConfig(
+        emb_dim=emb_dim, num_agents=2, k=2,
+        use_tgn=True, tgn_memory_dim=16, tgn_time_dim=8, tgn_n_attn_heads=2,
+    )
+    population = AgentPopulation(config)
+    loop = PSROLoop(config, judge=StaticJudge(0.5), graph=graph)
+
+    q_ids = node_ids[:2]
+    q_embs = population.embeddings_to_device(embs[:2])
+    pool_embs = population.embeddings_to_device(embs)
+
+    results = loop.step(population, q_embs, q_ids, pool_embs, node_ids)
+
+    # Basic shape checks
+    assert len(results) == 2
+    assert all("proposals" in r for r in results)
+    assert all("rewards" in r for r in results)
+
+    # TGN memories updated by judged edges wired via graph.extend inside PSROLoop
+    mems = tgn.get_memory(node_ids)
+    assert mems.shape == (n_nodes, 16)
+    # No NaN in any memory
+    assert not torch.any(torch.isnan(mems))
+
+
+def test_tgn_use_tgn_false_config_does_not_affect_graph_without_tgn():
+    """use_tgn=True in config but no tgn attached to graph → no crash, same behaviour."""
+    from multi_agent.graph import Graph
+    from multi_agent.config import MultiAgentConfig
+    from multi_agent.agent import AgentPopulation
+    from multi_agent.psro import PSROLoop
+    from multi_agent.judge import StaticJudge
+
+    torch.manual_seed(3)
+    np.random.seed(3)
+    emb_dim = 16
+    embs = np.random.randn(4, emb_dim).astype(np.float32)
+    ids = [f"x{i}" for i in range(4)]
+
+    graph = Graph(emb_dim=emb_dim)
+    graph.extend(ids, embs, [])
+
+    config = MultiAgentConfig(emb_dim=emb_dim, num_agents=2, k=2, use_tgn=True)
+    population = AgentPopulation(config)
+    loop = PSROLoop(config, judge=StaticJudge(0.0), graph=graph)
+
+    results = loop.step(
+        population,
+        population.embeddings_to_device(embs[:2]),
+        ids[:2],
+        population.embeddings_to_device(embs),
+        ids,
+    )
+    assert len(results) == 2
