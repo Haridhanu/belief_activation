@@ -43,3 +43,30 @@ class TemporalMessageEncoder(nn.Module):
             torch.tensor([abs(weight)], dtype=torch.float32, device=dev),
         ])
         return self.norm(self.proj(x))
+
+
+class NodeMemory:
+    """Per-node memory buffer. Plain Python — not an nn.Module.
+    Memory is always detached so gradients never accumulate across steps."""
+
+    def __init__(self, memory_dim: int) -> None:
+        self.memory_dim = memory_dim
+        self._store: dict[str, torch.Tensor] = {}
+
+    def get(self, node_id: str) -> torch.Tensor:
+        return self._store.get(node_id, torch.zeros(self.memory_dim))
+
+    def set(self, node_id: str, memory: torch.Tensor) -> None:
+        self._store[node_id] = memory.detach()
+
+    def get_batch(self, node_ids: list[str]) -> torch.Tensor:
+        return torch.stack([self.get(nid) for nid in node_ids])
+
+    def reset(self) -> None:
+        self._store.clear()
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {k: v.cpu().clone() for k, v in self._store.items()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        self._store = {k: v.clone() for k, v in state.items()}
