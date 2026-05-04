@@ -122,6 +122,26 @@ class Graph:
             if norm > 0 and np.isfinite(norm):
                 new_z = new_z / norm
             updates[v] = new_z
+
+        # TGN blend: mix projected memory into _z for touched nodes
+        if self._tgn is not None and touched:
+            touched_with_z = [v for v in touched if v in self._z]
+            if touched_with_z:
+                tgn_mems = self._tgn.get_memory(touched_with_z)       # (N, memory_dim)
+                projected = self._tgn.project_to_emb(tgn_mems)        # (N, emb_dim), detached
+                proj_np = projected.cpu().numpy().astype(np.float32)
+                for i, v in enumerate(touched_with_z):
+                    base = updates.get(v, self._z[v])
+                    tgn_contrib = proj_np[i]
+                    tc_norm = np.linalg.norm(tgn_contrib)
+                    if tc_norm > 0:
+                        tgn_contrib = tgn_contrib / tc_norm
+                    blended = (1.0 - self.tgn_blend) * base + self.tgn_blend * tgn_contrib
+                    b_norm = np.linalg.norm(blended)
+                    if b_norm > 0 and np.isfinite(b_norm):
+                        blended = blended / b_norm
+                    updates[v] = blended
+
         for v, new_z in updates.items():
             self._z[v] = new_z
 

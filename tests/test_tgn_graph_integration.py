@@ -93,3 +93,64 @@ def test_graph_no_tgn_z_identical_to_baseline():
 
     for nid in ids:
         np.testing.assert_array_equal(g1._z[nid], g2._z[nid])
+
+
+def test_graph_tgn_blend_changes_z_vs_baseline():
+    from multi_agent.graph import Graph
+    from multi_agent.tgn import TGNModule
+    torch.manual_seed(0)
+    np.random.seed(0)
+    embs = np.random.randn(3, 16).astype(np.float32)
+    ids = ["a", "b", "c"]
+    edges = [("a", "b", 0.8)]
+
+    # Baseline without TGN
+    g_base = Graph(emb_dim=16)
+    g_base.extend(ids, embs, [])
+    g_base.extend([], np.empty((0, 16), dtype=np.float32), edges)
+    z_base_a = g_base._z["a"].copy()
+
+    # Graph with TGN attached
+    tgn = TGNModule(emb_dim=16, memory_dim=16, time_dim=8, n_heads=2)
+    g_tgn = Graph(emb_dim=16)
+    g_tgn._tgn = tgn
+    g_tgn.extend(ids, embs, [])
+    g_tgn.extend([], np.empty((0, 16), dtype=np.float32), edges)
+    z_tgn_a = g_tgn._z["a"]
+
+    assert not np.allclose(z_base_a, z_tgn_a), \
+        "_z should differ when TGN memory is blended in"
+
+
+def test_graph_tgn_z_is_unit_normalized():
+    from multi_agent.graph import Graph
+    from multi_agent.tgn import TGNModule
+    torch.manual_seed(2)
+    np.random.seed(2)
+    embs = np.random.randn(4, 16).astype(np.float32)
+    tgn = TGNModule(emb_dim=16, memory_dim=16, time_dim=8, n_heads=2)
+    g = Graph(emb_dim=16)
+    g._tgn = tgn
+    g.extend(["a", "b", "c", "d"], embs, [])
+    g.extend([], np.empty((0, 16), dtype=np.float32),
+             [("a", "b", 0.9), ("b", "c", -0.4)])
+    for nid in ["a", "b"]:
+        norm = np.linalg.norm(g._z[nid])
+        assert abs(norm - 1.0) < 1e-5, f"_z[{nid}] not unit: norm={norm}"
+
+
+def test_graph_tgn_z_tensor_cache_invalidated_after_extend():
+    from multi_agent.graph import Graph
+    from multi_agent.tgn import TGNModule
+    embs = np.random.randn(3, 16).astype(np.float32)
+    ids = ["a", "b", "c"]
+    tgn = TGNModule(emb_dim=16, memory_dim=16, time_dim=8, n_heads=2)
+    g = Graph(emb_dim=16)
+    g._tgn = tgn
+    g.extend(ids, embs, [])
+    # Prime the cache
+    _ = g.get_representations_fast(ids)
+    assert g._z_tensor is not None
+    # New edge must invalidate it
+    g.extend([], np.empty((0, 16), dtype=np.float32), [("a", "b", 0.8)])
+    assert g._z_tensor is None
