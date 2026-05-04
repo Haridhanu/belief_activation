@@ -133,3 +133,35 @@ def test_memory_updater_is_deterministic():
     upd = MemoryUpdater(memory_dim=32)
     msg, mem = torch.randn(32), torch.randn(32)
     assert torch.allclose(upd(msg, mem), upd(msg, mem))
+
+
+def test_aggregator_output_shape():
+    from multi_agent.tgn import TemporalNeighborhoodAggregator
+    agg = TemporalNeighborhoodAggregator(memory_dim=32, n_heads=4)
+    out = agg(torch.randn(32), torch.randn(5, 32))
+    assert out.shape == (32,)
+
+
+def test_aggregator_single_neighbor():
+    from multi_agent.tgn import TemporalNeighborhoodAggregator
+    agg = TemporalNeighborhoodAggregator(memory_dim=32, n_heads=4)
+    out = agg(torch.randn(32), torch.randn(1, 32))
+    assert out.shape == (32,)
+
+
+def test_aggregator_is_deterministic():
+    from multi_agent.tgn import TemporalNeighborhoodAggregator
+    torch.manual_seed(0)
+    agg = TemporalNeighborhoodAggregator(memory_dim=32, n_heads=4)
+    q, nbrs = torch.randn(32), torch.randn(3, 32)
+    assert torch.allclose(agg(q, nbrs), agg(q, nbrs))
+
+
+def test_aggregator_different_neighbors_different_output():
+    from multi_agent.tgn import TemporalNeighborhoodAggregator
+    torch.manual_seed(1)
+    agg = TemporalNeighborhoodAggregator(memory_dim=32, n_heads=4)
+    q = torch.randn(32)
+    out1 = agg(q, torch.randn(3, 32))
+    out2 = agg(q, torch.randn(3, 32))
+    assert not torch.allclose(out1, out2)

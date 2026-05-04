@@ -86,3 +86,23 @@ class MemoryUpdater(nn.Module):
         return self.gru(
             message.unsqueeze(0), current_memory.unsqueeze(0)
         ).squeeze(0)
+
+
+class TemporalNeighborhoodAggregator(nn.Module):
+    """Attention over neighbor memories — used for soft link prediction."""
+
+    def __init__(self, memory_dim: int, n_heads: int = 4) -> None:
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=memory_dim, num_heads=n_heads, batch_first=True
+        )
+
+    def forward(
+        self,
+        query_mem: torch.Tensor,      # (memory_dim,)
+        neighbor_mems: torch.Tensor,  # (n_neighbors, memory_dim)
+    ) -> torch.Tensor:                # (memory_dim,)
+        q = query_mem.unsqueeze(0).unsqueeze(0)   # (1, 1, memory_dim)
+        kv = neighbor_mems.unsqueeze(0)            # (1, n_neighbors, memory_dim)
+        out, _ = self.attn(q, kv, kv)
+        return out.squeeze(0).squeeze(0)           # (memory_dim,)
