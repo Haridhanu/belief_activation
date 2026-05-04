@@ -106,3 +106,85 @@ class TemporalNeighborhoodAggregator(nn.Module):
         kv = neighbor_mems.unsqueeze(0)            # (1, n_neighbors, memory_dim)
         out, _ = self.attn(q, kv, kv)
         return out.squeeze(0).squeeze(0)           # (memory_dim,)
+
+
+class TGNModule(nn.Module):
+    """
+    Temporal Graph Network module for belief activation.
+
+    Maintains per-node memory that evolves as signed edges are committed.
+    Standalone: only depends on torch, no multi_agent imports.
+
+    Typical lifecycle per question/session:
+        tgn = TGNModule(emb_dim=768)
+        tgn.update(src, dst, sign, timestamp, weight)  # called by Graph.extend()
+        mems = tgn.get_memory(node_ids)                # called by Graph._update_representations()
+        tgn.reset()                                    # call before each new question
+    """
+
+    def __init__(
+        self,
+        emb_dim: int,
+        memory_dim: int = 128,
+        time_dim: int = 32,
+        n_heads: int = 4,
+    ) -> None:
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.memory_dim = memory_dim
+
+        self.time_encoder = TimeEncoder(time_dim)
+        self.msg_encoder = TemporalMessageEncoder(memory_dim, time_dim)
+        self.memory = NodeMemory(memory_dim)
+        self.updater = MemoryUpdater(memory_dim)
+        self.aggregator = TemporalNeighborhoodAggregator(memory_dim, n_heads)
+
+        # Projects memory → belief embedding space for _z blending
+        self.mem_to_emb = nn.Linear(memory_dim, emb_dim)
+        # Link predictor: concat(mem_i, mem_j) → [0, 1]
+        self.link_proj = nn.Linear(memory_dim * 2, 1)
+
+        self._ref_time: float = 0.0
+
+    def update(
+        self,
+        src_id: str,
+        dst_id: str,
+        sign: float,
+        timestamp: float,
+        edge_weight: float,
+    ) -> None:
+        """Process one edge event. Updates memory for both endpoints."""
+        delta_t = torch.tensor(timestamp - self._ref_time, dtype=torch.float32)
+        time_enc = self.time_encoder(delta_t)
+
+        src_mem = self.memory.get(src_id)
+        dst_mem = self.memory.get(dst_id)
+
+        # Symmetric: each node receives a message from the other
+        msg_for_dst = self.msg_encoder(src_mem, dst_mem, sign, time_enc, edge_weight)
+        msg_for_src = self.msg_encoder(dst_mem, src_mem, sign, time_enc, edge_weight)
+
+        self.memory.set(dst_id, self.updater(msg_for_dst, dst_mem))
+        self.memory.set(src_id, self.updater(msg_for_src, src_mem))
+        self._ref_time = timestamp
+
+    def get_memory(self, node_ids: list[str]) -> torch.Tensor:
+        """Return (N, memory_dim) memory matrix; zeros for unseen nodes."""
+        return self.memory.get_batch(node_ids)
+
+    def project_to_emb(self, memories: torch.Tensor) -> torch.Tensor:
+        """Project (N, memory_dim) → (N, emb_dim). Detached — no grad."""
+        with torch.no_grad():
+            return self.mem_to_emb(memories)
+
+    def predict_link(self, src_id: str, dst_id: str) -> float:
+        """Sigmoid score for edge (src, dst) based on current memories."""
+        combined = torch.cat([self.memory.get(src_id), self.memory.get(dst_id)])
+        with torch.no_grad():
+            return float(torch.sigmoid(self.link_proj(combined)).item())
+
+    def reset(self) -> None:
+        """Zero all memory. Call before processing a new question/session."""
+        self.memory.reset()
+        self._ref_time = 0.0

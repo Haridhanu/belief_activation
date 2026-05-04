@@ -165,3 +165,71 @@ def test_aggregator_different_neighbors_different_output():
     out1 = agg(q, torch.randn(3, 32))
     out2 = agg(q, torch.randn(3, 32))
     assert not torch.allclose(out1, out2)
+
+
+def test_tgn_module_memory_zero_before_any_update():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    mems = tgn.get_memory(["a", "b", "c"])
+    assert mems.shape == (3, 32)
+    assert torch.all(mems == 0)
+
+
+def test_tgn_module_update_makes_memory_nonzero():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    tgn.update("a", "b", sign=1.0, timestamp=1.0, edge_weight=0.9)
+    mems = tgn.get_memory(["a", "b"])
+    assert not torch.all(mems == 0)
+
+
+def test_tgn_module_second_update_changes_memory():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    tgn.update("a", "b", sign=1.0, timestamp=1.0, edge_weight=0.9)
+    mem_a_1 = tgn.get_memory(["a"])[0].clone()
+    tgn.update("a", "c", sign=-1.0, timestamp=2.0, edge_weight=0.7)
+    mem_a_2 = tgn.get_memory(["a"])[0]
+    assert not torch.allclose(mem_a_1, mem_a_2)
+
+
+def test_tgn_module_predict_link_in_unit_interval():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    score = tgn.predict_link("x", "y")
+    assert isinstance(score, float)
+    assert 0.0 <= score <= 1.0
+
+
+def test_tgn_module_predict_link_changes_after_update():
+    from multi_agent.tgn import TGNModule
+    torch.manual_seed(0)
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    before = tgn.predict_link("a", "b")
+    tgn.update("a", "b", sign=1.0, timestamp=1.0, edge_weight=0.9)
+    after = tgn.predict_link("a", "b")
+    assert before != after
+
+
+def test_tgn_module_reset_clears_memory():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    tgn.update("a", "b", sign=1.0, timestamp=1.0, edge_weight=0.9)
+    tgn.reset()
+    assert torch.all(tgn.get_memory(["a", "b"]) == 0)
+
+
+def test_tgn_module_project_to_emb_shape():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    mems = torch.randn(5, 32)
+    projected = tgn.project_to_emb(mems)
+    assert projected.shape == (5, 64)
+
+
+def test_tgn_module_project_to_emb_is_detached():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    mems = torch.randn(3, 32, requires_grad=False)
+    projected = tgn.project_to_emb(mems)
+    assert not projected.requires_grad
