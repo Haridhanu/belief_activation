@@ -112,3 +112,24 @@ def test_node_memory_state_dict_roundtrip():
     mem2.load_state_dict(sd)
     assert torch.allclose(mem.get("a"), mem2.get("a"))
     assert torch.allclose(mem.get("b"), mem2.get("b"))
+
+
+def test_memory_updater_output_shape():
+    from multi_agent.tgn import MemoryUpdater
+    upd = MemoryUpdater(memory_dim=32)
+    out = upd(torch.randn(32), torch.zeros(32))
+    assert out.shape == (32,)
+
+
+def test_memory_updater_changes_zero_memory():
+    from multi_agent.tgn import MemoryUpdater
+    upd = MemoryUpdater(memory_dim=32)
+    out = upd(torch.randn(32), torch.zeros(32))
+    assert not torch.allclose(out, torch.zeros(32))
+
+
+def test_memory_updater_is_deterministic():
+    from multi_agent.tgn import MemoryUpdater
+    upd = MemoryUpdater(memory_dim=32)
+    msg, mem = torch.randn(32), torch.randn(32)
+    assert torch.allclose(upd(msg, mem), upd(msg, mem))

@@ -70,3 +70,19 @@ class NodeMemory:
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
         self._store = {k: v.clone() for k, v in state.items()}
+
+
+class MemoryUpdater(nn.Module):
+    """GRUCell that updates one node's memory from an aggregated message."""
+
+    def __init__(self, memory_dim: int) -> None:
+        super().__init__()
+        self.gru = nn.GRUCell(input_size=memory_dim, hidden_size=memory_dim)
+
+    def forward(
+        self, message: torch.Tensor, current_memory: torch.Tensor
+    ) -> torch.Tensor:
+        # GRUCell expects (batch, dim) — unsqueeze/squeeze around the call
+        return self.gru(
+            message.unsqueeze(0), current_memory.unsqueeze(0)
+        ).squeeze(0)
