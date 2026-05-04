@@ -1,4 +1,5 @@
 from __future__ import annotations
+import io
 import torch
 import pytest
 
@@ -233,3 +234,46 @@ def test_tgn_module_project_to_emb_is_detached():
     mems = torch.randn(3, 32, requires_grad=False)
     projected = tgn.project_to_emb(mems)
     assert not projected.requires_grad
+
+
+def test_tgn_state_dict_roundtrip_restores_memories_and_predictions():
+    from multi_agent.tgn import TGNModule
+    torch.manual_seed(42)
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    tgn.update("a", "b", sign=1.0,  timestamp=1.0, edge_weight=0.9)
+    tgn.update("b", "c", sign=-1.0, timestamp=2.0, edge_weight=0.5)
+
+    sd = tgn.state_dict()
+
+    tgn2 = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    tgn2.load_state_dict(sd)
+
+    assert torch.allclose(
+        tgn.get_memory(["a", "b", "c"]),
+        tgn2.get_memory(["a", "b", "c"]),
+    )
+    assert abs(tgn.predict_link("a", "c") - tgn2.predict_link("a", "c")) < 1e-6
+
+
+def test_tgn_state_dict_only_stores_seen_nodes():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    tgn.update("a", "b", sign=1.0, timestamp=1.0, edge_weight=0.9)
+    sd = tgn.state_dict()
+    assert set(sd["_node_memory"].keys()) == {"a", "b"}
+
+
+def test_tgn_state_dict_torch_save_load_roundtrip():
+    from multi_agent.tgn import TGNModule
+    torch.manual_seed(7)
+    tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    tgn.update("x", "y", sign=-1.0, timestamp=3.0, edge_weight=0.6)
+
+    buf = io.BytesIO()
+    torch.save(tgn.state_dict(), buf)
+    buf.seek(0)
+
+    tgn2 = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
+    tgn2.load_state_dict(torch.load(buf, weights_only=False))
+
+    assert torch.allclose(tgn.get_memory(["x", "y"]), tgn2.get_memory(["x", "y"]))

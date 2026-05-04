@@ -188,3 +188,16 @@ class TGNModule(nn.Module):
         """Zero all memory. Call before processing a new question/session."""
         self.memory.reset()
         self._ref_time = 0.0
+
+    def state_dict(self, **kwargs) -> dict:
+        sd = super().state_dict(**kwargs)
+        sd["_node_memory"] = self.memory.state_dict()
+        sd["_ref_time"] = torch.tensor(self._ref_time)
+        return sd
+
+    def load_state_dict(self, state_dict: dict, strict: bool = True):
+        node_mem = state_dict.pop("_node_memory", {})
+        ref_time_t = state_dict.pop("_ref_time", torch.tensor(0.0))
+        super().load_state_dict(state_dict, strict=strict)
+        self.memory.load_state_dict(node_mem)
+        self._ref_time = float(ref_time_t.item())
