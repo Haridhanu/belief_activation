@@ -1,0 +1,32 @@
+[project]
+name = "multi-agent"
+version = "0.1.0"
+description = "Correlated equilibrium over belief graphs via masked multi-agent attention"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "torch>=2.0",
+    "transformers>=4.40",
+    "google-genai>=0.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/multi_agent"]
+
+[dependency-groups]
+dev = ["pytest>=7.0"]
+notebook = [
+    "datasets>=4.8.5",
+    "ipykernel>=6.0",
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "sentence-transformers>=2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

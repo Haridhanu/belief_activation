@@ -1,0 +1,48 @@
+attention:
+  emb_dim: 32
+  emb_dim_raw: 768
+  decay_rate: 0.9
+  decay_threshold: 0.1
+  graph_hops: 2
+
+recurrence:
+  enabled: false
+  hidden_dim: 32
+  reset_strategy: per_batch
+
+mixture:
+  confidence_threshold: 0.6
+  probe_frequency: 8
+
+equilibrium:
+  max_iterations: 100
+  tolerance: 1.0e-6
+  lazy: true
+  coordination_weight: 0.5
+  structural_weight: 0.3
+  dissonance_weight: 0.2
+  retrieval_weight: 0.15
+  coherence_threshold: 0.3
+  alignment_threshold: 0.2
+
+population:
+  num_agents: 5
+  masks_per_agent: 8
+  temperature: 0.3
+
+psro:
+  enabled: true
+  tournament_size: 3
+  oracle_lr: 0.02
+  max_population: 5
+  edge_proposals: 4
+  trigger: batch
+  held_out_k: 32
+
+vector:
+  backend: local
+  emb_model: all-mpnet-base-v2
+
+storage:
+  backend: local
+  session_prefix: ma
