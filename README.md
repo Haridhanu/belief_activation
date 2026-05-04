@@ -68,6 +68,51 @@ Two methods consume this:
 
 Coherence/contradiction asymmetry comes for free: the prior aggregates **signed** weights, so a node strongly contradicting a coherent neighborhood gets `mu < 0` and vice versa.
 
+## Temporal memory (TGN)
+
+`src/multi_agent/tgn.py` adds an optional Temporal Graph Network module that gives each node a learned memory vector evolved over the *order* in which signed edges arrived. It's standalone (only depends on `torch`) and the `Graph` integration is fully gated — when no `TGNModule` is attached, `Graph` behaviour is bit-identical to the baseline.
+
+**Components.** `TimeEncoder` (deterministic sinusoidal Δt → time_dim), `TemporalMessageEncoder` (`(src_mem, dst_mem, sign, time_enc, |w|) → memory_dim`), `NodeMemory` (per-node detached buffer, plain Python — no autograd state across steps), `MemoryUpdater` (GRUCell), `TemporalNeighborhoodAggregator` (multi-head attention over neighbor memories). `TGNModule` wires them together and adds `mem_to_emb` (memory_dim → emb_dim, used for blending) and `link_proj` (concat memories → sigmoid score).
+
+**Wiring into Graph.** Two hooks, both no-ops when `graph._tgn is None`:
+
+1. **`extend()`** — for each new signed edge `(a, b, w)` that survives dedup, calls `tgn.update(a, b, sign=±1/0, timestamp=_edge_count, edge_weight=w)`. The timestamp is a monotonic edge counter, not wall-clock — TGN cares about *order*, not real time.
+2. **`_update_representations()`** — after the existing signed-attention update produces `updates`, the projected memory of each touched node is blended in:
+
+   ```
+   z_new = normalize( (1 − tgn_blend) · z_signed + tgn_blend · normalize(mem_to_emb(memory_v)) )
+   ```
+
+   `tgn_blend` defaults to `0.3`. The projection runs under `torch.no_grad()` so TGN gradients never flow into the policy graph.
+
+**Config.** Four new fields on `MultiAgentConfig`, all default to safe no-ops:
+
+| Field | Default | Effect |
+|---|---|---|
+| `use_tgn` | `False` | Caller flag — tells the runner whether to construct a `TGNModule` and attach it |
+| `tgn_memory_dim` | `128` | Per-node memory vector size |
+| `tgn_time_dim` | `32` | Time encoding dimensionality |
+| `tgn_n_attn_heads` | `4` | Attention heads in the aggregator |
+
+`use_tgn=True` in config but no `tgn` attached to `graph` is fine — the gates are checked on `graph._tgn`, not the config.
+
+**Persistence.** `TGNModule.state_dict()` / `load_state_dict()` round-trip both the `nn.Module` parameters and the per-node memory dictionary, so checkpoints survive `torch.save` / `torch.load`. Only nodes with non-default memory are serialized.
+
+**Lifecycle.** Memory persists across `extend()` calls within one `Graph`. Call `tgn.reset()` between independent questions/sessions.
+
+**Usage.**
+
+```python
+from multi_agent.graph import Graph
+from multi_agent.tgn import TGNModule
+
+tgn = TGNModule(emb_dim=768)            # memory_dim/time_dim default to 128/32
+graph = Graph(emb_dim=768)
+graph._tgn = tgn                         # attaches the hooks
+graph.extend(node_ids, embs, edges)      # extend() now updates tgn memory
+                                         # and _z is blended with projected memory
+```
+
 ## CPU / GPU
 
 Two independent device knobs:
@@ -82,7 +127,7 @@ This split exists because the policy is tiny (a few projections + MLP, microseco
 
 ```bash
 uv sync --group notebook                            # install + dev/notebook deps
-uv run pytest                                       # 11 tests
+uv run pytest                                       # 54 tests
 uv run python scripts/fetch_financebench.py        # pre-pull the dataset (optional; load_financebench() does it lazily)
 uv run jupyter lab demo.ipynb                       # the FinanceBench notebook
 ```
