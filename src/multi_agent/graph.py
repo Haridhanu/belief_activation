@@ -3,8 +3,12 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from multi_agent.tgn import TGNModule
 
 
 @dataclass
@@ -21,6 +25,10 @@ class Graph:
     _edges: dict[tuple[str, str], float] = field(default_factory=dict)
     _z_tensor: np.ndarray | None = None
     _z_index: dict[str, int] = field(default_factory=dict)
+
+    _tgn: TGNModule | None = field(default=None, repr=False)
+    _edge_count: int = field(default=0, init=False, repr=False)
+    tgn_blend: float = field(default=0.3, repr=False)
 
     def __len__(self) -> int:
         return len(self._raw)
@@ -67,6 +75,16 @@ class Graph:
                 self._adj[a].add(b)
                 self._adj[b].add(a)
                 self._edges[key] = float(w)
+                # Notify TGN of the new edge event
+                if self._tgn is not None:
+                    _sign = 1.0 if w > 0 else (-1.0 if w < 0 else 0.0)
+                    self._tgn.update(
+                        a, b,
+                        sign=_sign,
+                        timestamp=float(self._edge_count),
+                        edge_weight=float(w),
+                    )
+                    self._edge_count += 1
                 touched.add(a)
                 touched.add(b)
         if touched:
