@@ -47,6 +47,7 @@ class MultiAgentConfig:
     tgn_blend: float = 0.3
     time_decay: float = 0.1
     baseline_norm: float = 1.0
+    impute_blend_lr: float = 1e-3
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MultiAgentConfig":
