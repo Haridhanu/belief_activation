@@ -203,6 +203,69 @@ def test_psro_step_completes_with_tgn_attached():
     assert not torch.any(torch.isnan(mems))
 
 
+def test_graph_edge_count_starts_at_zero():
+    from multi_agent.graph import Graph
+
+    g = Graph(emb_dim=16)
+    assert g._edge_count == 0
+
+
+def test_graph_edge_count_increments_per_new_edge_without_tgn():
+    """_edge_count must increment for every new unique edge, regardless of TGN."""
+    from multi_agent.graph import Graph
+
+    embs = np.random.randn(3, 16).astype(np.float32)
+    g = Graph(emb_dim=16)
+    g.extend(["a", "b", "c"], embs, [("a", "b", 0.9)])
+    assert g._edge_count == 1
+    g.extend([], np.empty((0, 16), dtype=np.float32), [("b", "c", -0.7)])
+    assert g._edge_count == 2
+
+
+def test_graph_edge_count_increments_with_tgn():
+    from multi_agent.graph import Graph
+    from multi_agent.tgn import TGNModule
+
+    torch.manual_seed(0)
+    embs = np.random.randn(3, 16).astype(np.float32)
+    tgn = TGNModule(emb_dim=16, memory_dim=16, time_dim=8, n_heads=2)
+    g = Graph(emb_dim=16)
+    g._tgn = tgn
+    g.extend(["a", "b", "c"], embs, [("a", "b", 0.9)])
+    assert g._edge_count == 1
+    g.extend([], np.empty((0, 16), dtype=np.float32), [("b", "c", -0.7)])
+    assert g._edge_count == 2
+
+
+def test_graph_duplicate_edge_does_not_increment_count():
+    from multi_agent.graph import Graph
+
+    embs = np.random.randn(2, 16).astype(np.float32)
+    g = Graph(emb_dim=16)
+    g.extend(["a", "b"], embs, [("a", "b", 0.9)])
+    g.extend([], np.empty((0, 16), dtype=np.float32), [("a", "b", 0.9)])
+    assert g._edge_count == 1
+
+
+def test_graph_edge_timestamps_recorded():
+    """Every committed edge gets a stable timestamp = its insertion order."""
+    from multi_agent.graph import Graph
+
+    embs = np.random.randn(3, 16).astype(np.float32)
+    g = Graph(emb_dim=16)
+    g.extend(["a", "b", "c"], embs, [("a", "b", 0.9), ("b", "c", -0.5)])
+    assert g._edge_timestamps[("a", "b")] == 1
+    assert g._edge_timestamps[("b", "c")] == 2
+
+
+def test_graph_time_decay_field_default():
+    from multi_agent.graph import Graph
+
+    g = Graph(emb_dim=16)
+    assert g.time_decay == 0.1
+    assert g.baseline_norm == 1.0
+
+
 def test_tgn_use_tgn_false_config_does_not_affect_graph_without_tgn():
     """use_tgn=True in config but no tgn attached to graph → no crash, same behaviour."""
     from multi_agent.graph import Graph

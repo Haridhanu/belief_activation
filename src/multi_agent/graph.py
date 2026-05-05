@@ -28,7 +28,12 @@ class Graph:
 
     _tgn: TGNModule | None = field(default=None, repr=False)
     _edge_count: int = field(default=0, init=False, repr=False)
+    _edge_timestamps: dict[tuple[str, str], int] = field(
+        default_factory=dict, init=False, repr=False
+    )
     tgn_blend: float = field(default=0.3, repr=False)
+    time_decay: float = field(default=0.1, repr=False)
+    baseline_norm: float = field(default=1.0, repr=False)
 
     def __len__(self) -> int:
         return len(self._raw)
@@ -75,6 +80,8 @@ class Graph:
                 self._adj[a].add(b)
                 self._adj[b].add(a)
                 self._edges[key] = float(w)
+                self._edge_count += 1
+                self._edge_timestamps[key] = self._edge_count
                 # Notify TGN of the new edge event
                 if self._tgn is not None:
                     _sign = 1.0 if w > 0 else (-1.0 if w < 0 else 0.0)
@@ -84,7 +91,6 @@ class Graph:
                         timestamp=float(self._edge_count),
                         edge_weight=float(w),
                     )
-                    self._edge_count += 1
                 touched.add(a)
                 touched.add(b)
         if touched:
