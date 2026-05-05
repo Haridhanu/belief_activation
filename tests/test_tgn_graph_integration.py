@@ -266,6 +266,99 @@ def test_graph_time_decay_field_default():
     assert g.baseline_norm == 1.0
 
 
+def test_prior_no_tgn_unchanged_by_timestamps():
+    """With no TGN attached, _prior must ignore _edge_timestamps entirely."""
+    from multi_agent.graph import Graph
+
+    embs = np.eye(16, dtype=np.float32)[:3]
+    g = Graph(emb_dim=16)
+    g.extend(["q", "k", "c"], embs, [("q", "k", 1.0), ("k", "c", 0.8)])
+    _, _, prec_fresh = g._prior("q", "c")
+
+    # Age the edge bookkeeping artificially — must not move the prior.
+    g._edge_count = 1000
+    _, _, prec_old = g._prior("q", "c")
+    assert prec_old == prec_fresh
+
+
+def test_prior_with_tgn_stale_path_lower_precision():
+    """With TGN attached: a stale 2-hop path → lower data_precision."""
+    from multi_agent.graph import Graph
+    from multi_agent.tgn import TGNModule
+
+    torch.manual_seed(0)
+    embs = np.eye(16, dtype=np.float32)[:3]
+
+    g_base = Graph(emb_dim=16)
+    g_base.extend(["q", "k", "c"], embs.copy(), [("q", "k", 1.0), ("k", "c", 0.8)])
+    _, _, prec_base = g_base._prior("q", "c")
+
+    g_tgn = Graph(
+        emb_dim=16,
+        _tgn=TGNModule(emb_dim=16, memory_dim=16, time_dim=8, n_heads=2),
+        tgn_blend=0.0,
+        time_decay=0.1,
+        baseline_norm=0.01,  # ensure mem_weight saturates at 1 so recency dominates
+    )
+    g_tgn.extend(["q", "k", "c"], embs.copy(), [("q", "k", 1.0)])
+    g_tgn._edge_count = 50  # age the first edge before adding the second
+    g_tgn.extend([], np.empty((0, 16), dtype=np.float32), [("k", "c", 0.8)])
+    _, _, prec_tgn = g_tgn._prior("q", "c")
+
+    assert prec_tgn < prec_base, (
+        f"TGN precision should drop on stale path: tgn={prec_tgn:.4f} base={prec_base:.4f}"
+    )
+
+
+def test_prior_with_tgn_fresh_path_close_to_baseline():
+    """With TGN + tiny time_decay: precision stays near the structural baseline."""
+    from multi_agent.graph import Graph
+    from multi_agent.tgn import TGNModule
+
+    torch.manual_seed(0)
+    embs = np.eye(16, dtype=np.float32)[:3]
+
+    g_base = Graph(emb_dim=16)
+    g_base.extend(["q", "k", "c"], embs.copy(), [("q", "k", 1.0), ("k", "c", 0.8)])
+    _, _, prec_base = g_base._prior("q", "c")
+
+    g_tgn = Graph(
+        emb_dim=16,
+        _tgn=TGNModule(emb_dim=16, memory_dim=16, time_dim=8, n_heads=2),
+        tgn_blend=0.0,
+        time_decay=0.001,
+        baseline_norm=0.01,  # mem_weight = 1 → only recency varies
+    )
+    g_tgn.extend(["q", "k", "c"], embs.copy(), [("q", "k", 1.0), ("k", "c", 0.8)])
+    _, _, prec_tgn = g_tgn._prior("q", "c")
+
+    assert prec_tgn >= prec_base * 0.95, (
+        f"Fresh-path TGN precision dropped too much: tgn={prec_tgn:.4f} base={prec_base:.4f}"
+    )
+
+
+def test_impute_returns_none_for_stale_paths_below_floor():
+    """With aggressive decay, impute() on a stale path returns None."""
+    from multi_agent.graph import Graph
+    from multi_agent.tgn import TGNModule
+
+    torch.manual_seed(0)
+    embs = np.eye(16, dtype=np.float32)[:3]
+
+    g = Graph(
+        emb_dim=16,
+        _tgn=TGNModule(emb_dim=16, memory_dim=16, time_dim=8, n_heads=2),
+        tgn_blend=0.0,
+        time_decay=1.0,
+        confidence_floor=0.1,
+        baseline_norm=0.01,
+    )
+    g.extend(["q", "k", "c"], embs, [("q", "k", 1.0)])
+    g._edge_count = 100
+    g.extend([], np.empty((0, 16), dtype=np.float32), [("k", "c", 0.8)])
+    assert g.impute("q", "c") is None
+
+
 def test_tgn_use_tgn_false_config_does_not_affect_graph_without_tgn():
     """use_tgn=True in config but no tgn attached to graph → no crash, same behaviour."""
     from multi_agent.graph import Graph

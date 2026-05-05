@@ -157,6 +157,7 @@ class Graph:
             return observed, self.obs_variance, 1.0 / self.obs_variance
         numerator = 0.0
         sq_weight_sum = 0.0
+        current_t = self._edge_count
         for k, w_qk in self.get_neighbors(q):
             if k == c or k == q:
                 continue
@@ -164,8 +165,26 @@ class Graph:
             if y_kc is None:
                 continue
             w = float(w_qk)
-            numerator += w * y_kc
-            sq_weight_sum += w * w
+
+            if self._tgn is not None:
+                # Recency: decay by age of the oldest edge in the 2-hop path.
+                # A chain is only as fresh as its weakest link.
+                t_qk = self._edge_timestamps.get(self._edge_key(q, k), 0)
+                t_kc = self._edge_timestamps.get(self._edge_key(k, c), 0)
+                recency = math.exp(
+                    -self.time_decay * float(current_t - min(t_qk, t_kc))
+                )
+                # Memory reliability: a node with little history is a weak relay.
+                mem_norm = float(self._tgn.get_memory([k])[0].norm().item())
+                mem_weight = min(
+                    1.0, mem_norm / max(self.baseline_norm, 1e-8)
+                )
+                path_weight = recency * mem_weight * w
+            else:
+                path_weight = w
+
+            numerator += path_weight * y_kc
+            sq_weight_sum += path_weight * path_weight
         data_precision = sq_weight_sum / self.obs_variance
         total_precision = data_precision + 1.0 / self.prior_variance
         mu = (numerator / self.obs_variance) / total_precision
