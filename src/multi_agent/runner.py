@@ -157,7 +157,25 @@ class Trainer:
         self.config = config
         self.judge = judge
         self.population = AgentPopulation(config)
-        self.graph = Graph(emb_dim=config.emb_dim)
+
+        tgn = None
+        if config.use_tgn:
+            from multi_agent.tgn import TGNModule
+
+            tgn = TGNModule(
+                emb_dim=config.emb_dim,
+                memory_dim=config.tgn_memory_dim,
+                time_dim=config.tgn_time_dim,
+                n_heads=config.tgn_n_attn_heads,
+            )
+
+        self.graph = Graph(
+            emb_dim=config.emb_dim,
+            _tgn=tgn,
+            tgn_blend=config.tgn_blend,
+            time_decay=config.time_decay,
+            baseline_norm=config.baseline_norm,
+        )
         self.loop = PSROLoop(config, judge=judge, graph=self.graph)
         self.score_cache: dict[tuple[str, str], float] = {}
         self.node_texts: dict[str, str] = {}

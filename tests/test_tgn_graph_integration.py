@@ -337,6 +337,74 @@ def test_prior_with_tgn_fresh_path_close_to_baseline():
     )
 
 
+def test_trainer_attaches_tgn_when_use_tgn_true():
+    """Trainer must construct a TGNModule and attach it to graph when use_tgn=True."""
+    from multi_agent.config import MultiAgentConfig
+    from multi_agent.runner import Trainer
+    from multi_agent.judge import StaticJudge
+    from multi_agent.tgn import TGNModule
+
+    cfg = MultiAgentConfig(
+        emb_dim=16,
+        num_agents=2,
+        k=2,
+        use_tgn=True,
+        tgn_memory_dim=16,
+        tgn_time_dim=8,
+        tgn_n_attn_heads=2,
+    )
+    trainer = Trainer(cfg, StaticJudge(0.5))
+    assert trainer.graph._tgn is not None
+    assert isinstance(trainer.graph._tgn, TGNModule)
+    assert trainer.graph.tgn_blend == cfg.tgn_blend
+    assert trainer.graph.time_decay == cfg.time_decay
+    assert trainer.graph.baseline_norm == cfg.baseline_norm
+
+
+def test_trainer_no_tgn_when_use_tgn_false():
+    from multi_agent.config import MultiAgentConfig
+    from multi_agent.runner import Trainer
+    from multi_agent.judge import StaticJudge
+
+    cfg = MultiAgentConfig(emb_dim=16, num_agents=2, k=2, use_tgn=False)
+    trainer = Trainer(cfg, StaticJudge(0.5))
+    assert trainer.graph._tgn is None
+
+
+def test_trainer_step_runs_with_tgn_enabled():
+    """End-to-end: Trainer.step completes when TGN is built from config."""
+    from multi_agent.config import MultiAgentConfig
+    from multi_agent.runner import Trainer
+    from multi_agent.judge import StaticJudge
+    from multi_agent.benchmarks import Batch
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    cfg = MultiAgentConfig(
+        emb_dim=16,
+        num_agents=2,
+        k=2,
+        use_tgn=True,
+        tgn_memory_dim=16,
+        tgn_time_dim=8,
+        tgn_n_attn_heads=2,
+    )
+    trainer = Trainer(cfg, StaticJudge(0.5))
+
+    embs = np.random.randn(4, 16).astype(np.float32)
+    batch = Batch(ids=["a", "b", "c", "d"], embs=embs, texts=["a", "b", "c", "d"])
+    trainer.step(batch)
+
+    # After at least one judged edge, at least one node's TGN memory must be non-zero.
+    if trainer.graph._edge_count > 0:
+        any_active = any(
+            not torch.all(trainer.graph._tgn.get_memory([nid])[0] == 0.0)
+            for nid in trainer.graph.get_nodes()
+        )
+        assert any_active, "TGN memory should populate after a judged edge"
+
+
 def test_impute_returns_none_for_stale_paths_below_floor():
     """With aggressive decay, impute() on a stale path returns None."""
     from multi_agent.graph import Graph
