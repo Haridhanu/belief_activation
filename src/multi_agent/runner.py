@@ -176,6 +176,16 @@ class Trainer:
             time_decay=config.time_decay,
             baseline_norm=config.baseline_norm,
         )
+
+        if config.use_tgn:
+            from multi_agent.imputation import BlendedImputer
+
+            self.graph._imputer = BlendedImputer(
+                graph=self.graph,
+                tgn=tgn,
+                lr=config.impute_blend_lr,
+            )
+
         self.loop = PSROLoop(config, judge=judge, graph=self.graph)
         self.score_cache: dict[tuple[str, str], float] = {}
         self.node_texts: dict[str, str] = {}

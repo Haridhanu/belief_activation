@@ -371,6 +371,16 @@ class PSROLoop:
             else []
         )
 
+        # Train the BlendedImputer's gate on judge-revealed pairs BEFORE
+        # extend, so it sees the pre-update graph state.
+        imputer_loss: float = 0.0
+        if (
+            self._graph is not None
+            and getattr(self._graph, "_imputer", None) is not None
+            and judged.judged_pairs
+        ):
+            imputer_loss = self._graph._imputer.train_on_judged(judged.judged_pairs)
+
         # Post-judge impute: now that q has its first neighborhood (from
         # the judged edges), re-impute any pairs we skipped for budget.
         score_by_pair, stats = self._impute_after_judge(
@@ -384,6 +394,7 @@ class PSROLoop:
             "meta_rewards": meta_rewards,
             "sigma": self.sigma,
             "field_revealed": field_revealed,
+            "imputer_loss": imputer_loss,
         }
         return self._results(query_ids, agents, batch.by_agent, score_by_pair, rewards)
 

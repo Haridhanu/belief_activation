@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
+    from multi_agent.imputation import BlendedImputer
     from multi_agent.tgn import TGNModule
 
 
@@ -34,6 +35,7 @@ class Graph:
     tgn_blend: float = field(default=0.3, repr=False)
     time_decay: float = field(default=0.1, repr=False)
     baseline_norm: float = field(default=1.0, repr=False)
+    _imputer: "BlendedImputer | None" = field(default=None, repr=False)
 
     def __len__(self) -> int:
         return len(self._raw)
@@ -194,17 +196,22 @@ class Graph:
     def impute(self, q: str, c: str) -> float | None:
         if q == c:
             return None
+        if self._imputer is not None:
+            return self._imputer.impute(q, c)
         mu, _, data_precision = self._prior(q, c)
         if data_precision < self.confidence_floor:
             return None
         return float(max(-1.0, min(1.0, mu)))
 
     def field(self, q: str, c: str) -> float:
-        """Bayesian mean prediction for edge ``(q, c)``, always defined.
+        """Mean prediction for edge ``(q, c)``, always defined.
 
-        Same as ``impute`` but without the confidence floor — returns the
-        prior mean clamped to ``[-1, 1]`` even when support is weak.
+        Delegates to the attached :py:class:`BlendedImputer` when one is
+        wired up; otherwise falls back to the Bayesian prior mean clamped to
+        ``[-1, 1]``.
         """
+        if self._imputer is not None:
+            return self._imputer.field(q, c)
         mu, _, _ = self._prior(q, c)
         return float(max(-1.0, min(1.0, mu)))
 
