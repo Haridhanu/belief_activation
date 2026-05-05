@@ -40,3 +40,38 @@ def test_from_yaml_unknown_key_raises(tmp_path):
     p.write_text("emb_dim: 16\nbogus_field: 42\n")
     with pytest.raises(TypeError):
         MultiAgentConfig.from_yaml(p)
+
+
+def test_config_tgn_defaults_to_disabled():
+    cfg = MultiAgentConfig()
+    assert cfg.use_tgn is False
+    assert cfg.tgn_memory_dim == 128
+    assert cfg.tgn_time_dim == 32
+    assert cfg.tgn_blend == 0.3
+    assert cfg.time_decay == 0.1
+
+
+def test_config_tgn_fields_survive_yaml_round_trip(tmp_path):
+    import yaml
+
+    cfg = MultiAgentConfig(
+        use_tgn=True, tgn_memory_dim=64, tgn_time_dim=16, tgn_blend=0.2, time_decay=0.05
+    )
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        yaml.dump(
+            {
+                "use_tgn": True,
+                "tgn_memory_dim": 64,
+                "tgn_time_dim": 16,
+                "tgn_blend": 0.2,
+                "time_decay": 0.05,
+            }
+        )
+    )
+    loaded = MultiAgentConfig.from_yaml(path)
+    assert loaded.use_tgn is True
+    assert loaded.tgn_memory_dim == 64
+    assert loaded.tgn_time_dim == 16
+    assert loaded.tgn_blend == 0.2
+    assert loaded.time_decay == 0.05

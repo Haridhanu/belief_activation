@@ -44,6 +44,9 @@ class MultiAgentConfig:
     tgn_memory_dim: int = 128
     tgn_time_dim: int = 32
     tgn_n_attn_heads: int = 4
+    tgn_blend: float = 0.3
+    time_decay: float = 0.1
+    baseline_norm: float = 1.0
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MultiAgentConfig":
