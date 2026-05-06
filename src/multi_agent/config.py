@@ -49,6 +49,14 @@ class MultiAgentConfig:
     baseline_norm: float = 1.0
     impute_blend_lr: float = 1e-3
 
+    # Engine selector — picks the inner training loop:
+    #   "psro"     : current multi-agent + PSRO trainer (default, unchanged)
+    #   "tgn_only" : TGN-only active-learning trainer (no agents, no Bayes)
+    engine: str = "psro"
+    tgn_only_lr: float = 1e-3
+    tgn_only_commit_threshold: float = 0.5
+    tgn_only_candidate_k: int = 8
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MultiAgentConfig":
 
