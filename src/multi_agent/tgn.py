@@ -141,8 +141,15 @@ class TGNModule(nn.Module):
 
         # Projects memory → belief embedding space for _z blending
         self.mem_to_emb = nn.Linear(memory_dim, emb_dim)
-        # Link predictor: concat(mem_i, mem_j) → [0, 1]
-        self.link_proj = nn.Linear(memory_dim * 2, 1)
+        # Link predictor head: concat(mem_i, mem_j) → signed score in [-1, 1].
+        # Trainable end-to-end via ``link_loss``; replaces the legacy
+        # untrained sigmoid head.
+        self.link_head = nn.Sequential(
+            nn.Linear(memory_dim * 2, memory_dim),
+            nn.ReLU(),
+            nn.Linear(memory_dim, 1),
+            nn.Tanh(),
+        )
 
         self._ref_time: float = 0.0
 
@@ -179,10 +186,43 @@ class TGNModule(nn.Module):
             return self.mem_to_emb(memories)
 
     def predict_link(self, src_id: str, dst_id: str) -> float:
-        """Sigmoid score for edge (src, dst) based on current memories."""
+        """Trained signed score for edge (src, dst) in ``[-1, 1]``.
+
+        Forward pass through ``link_head``. Detached — for inference. Use
+        :py:meth:`predict_link_grad` when you need gradient (e.g. inside
+        :py:meth:`link_loss`).
+        """
         combined = torch.cat([self.memory.get(src_id), self.memory.get(dst_id)])
         with torch.no_grad():
-            return float(torch.sigmoid(self.link_proj(combined)).item())
+            return float(self.link_head(combined).item())
+
+    def predict_link_grad(self, src_id: str, dst_id: str) -> torch.Tensor:
+        """Same as :py:meth:`predict_link` but with autograd enabled.
+
+        Returns a 0-d tensor in ``[-1, 1]``. Memory tensors are detached on
+        store, so gradient stops at the boundary — only ``link_head``'s
+        parameters receive grad through this call.
+        """
+        combined = torch.cat([self.memory.get(src_id), self.memory.get(dst_id)])
+        return self.link_head(combined).squeeze(-1)
+
+    def link_loss(
+        self, pairs: list[tuple[str, str, float]]
+    ) -> torch.Tensor:
+        """MSE between predicted signed link strength and judge ``y``.
+
+        ``pairs`` is a list of ``(src_id, dst_id, y_target)``. Returns a
+        scalar Tensor suitable for ``.backward()``. Empty list → 0-tensor.
+        """
+        if not pairs:
+            return torch.zeros((), requires_grad=True)
+        preds = torch.stack(
+            [self.predict_link_grad(s, d) for s, d, _ in pairs]
+        )
+        targets = torch.tensor(
+            [float(y) for _, _, y in pairs], dtype=torch.float32
+        )
+        return ((preds - targets) ** 2).mean()
 
     def reset(self) -> None:
         """Zero all memory. Call before processing a new question/session."""

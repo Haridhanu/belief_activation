@@ -194,12 +194,47 @@ def test_tgn_module_second_update_changes_memory():
     assert not torch.allclose(mem_a_1, mem_a_2)
 
 
-def test_tgn_module_predict_link_in_unit_interval():
+def test_tgn_module_predict_link_in_signed_interval():
+    """predict_link is now a trained signed predictor: output in [-1, 1]."""
     from multi_agent.tgn import TGNModule
     tgn = TGNModule(emb_dim=64, memory_dim=32, time_dim=16, n_heads=2)
     score = tgn.predict_link("x", "y")
     assert isinstance(score, float)
-    assert 0.0 <= score <= 1.0
+    assert -1.0 <= score <= 1.0
+
+
+def test_tgn_link_loss_drives_predictions_toward_targets():
+    """Repeated training on consistent (pair, y) pairs must move predictions
+    toward y. This is the core contract of the new trainable link head."""
+    import torch
+
+    from multi_agent.tgn import TGNModule
+    torch.manual_seed(0)
+    tgn = TGNModule(emb_dim=32, memory_dim=16, time_dim=8, n_heads=2)
+    # Seed memories so link_head has non-zero input
+    tgn.update("a", "b", sign=1.0, timestamp=1.0, edge_weight=0.9)
+    tgn.update("b", "c", sign=-1.0, timestamp=2.0, edge_weight=0.7)
+
+    pairs = [("a", "b", 0.9), ("b", "c", -0.8)]
+    optimizer = torch.optim.Adam(tgn.parameters(), lr=1e-2)
+    losses: list[float] = []
+    for _ in range(50):
+        optimizer.zero_grad()
+        loss = tgn.link_loss(pairs)
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.item()))
+
+    assert losses[-1] < losses[0], (
+        f"link_loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
+    )
+
+
+def test_tgn_link_loss_empty_pairs_returns_zero():
+    from multi_agent.tgn import TGNModule
+    tgn = TGNModule(emb_dim=32, memory_dim=16, time_dim=8, n_heads=2)
+    loss = tgn.link_loss([])
+    assert float(loss.item()) == 0.0
 
 
 def test_tgn_module_predict_link_changes_after_update():
