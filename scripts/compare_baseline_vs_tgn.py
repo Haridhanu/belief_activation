@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -32,6 +33,7 @@ from multi_agent.benchmarks import Batch
 from multi_agent.config import MultiAgentConfig
 from multi_agent.judge import StaticJudge
 from multi_agent.runner import Trainer
+from multi_agent.tgn_runner import TGNTrainer
 
 
 EMB_DIM = 32
@@ -113,6 +115,10 @@ class RunStats:
     held_out_accuracy: float
     held_out_mae: float
     held_out_n: int
+    total_wall_time_s: float
+    mean_step_ms: float
+    p95_step_ms: float
+    time_per_judge_call_s: float
     # Mapping: (q, c) → (yhat, y_true) for every pair *not* committed.
     # Used downstream to compute a "common held-out" accuracy across configs.
     held_out_predictions: dict[tuple[str, str], tuple[float, float]] = None  # type: ignore
@@ -122,7 +128,7 @@ def _run_one(
     *,
     label: str,
     seed: int,
-    use_tgn: bool,
+    engine: str,                         # "baseline" | "tgn_imputer" | "tgn_only"
     ids: list[str],
     embs: np.ndarray,
     cluster_of: dict[str, int],
@@ -134,6 +140,9 @@ def _run_one(
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+    use_tgn = engine == "tgn_imputer"
+    config_engine = "tgn_only" if engine == "tgn_only" else "psro"
 
     cfg = MultiAgentConfig(
         emb_dim=EMB_DIM,
@@ -147,22 +156,32 @@ def _run_one(
         },
         judge_budget_per_batch=judge_budget,
         use_tgn=use_tgn,
+        engine=config_engine,
         tgn_memory_dim=32,
         tgn_time_dim=8,
         tgn_n_attn_heads=2,
     )
     judge = _judge_for(cluster_of, judge_noise=judge_noise, seed=seed + 7919)
-    trainer = Trainer(cfg, judge)
+    trainer: Trainer | TGNTrainer
+    if engine == "tgn_only":
+        trainer = TGNTrainer(cfg, judge)
+    else:
+        trainer = Trainer(cfg, judge)
 
     total = {"scorable": 0, "judged": 0, "imputed": 0, "cached": 0, "skipped": 0}
+    step_times_ms: list[float] = []
+    t_run_start = time.perf_counter()
     for _ in range(steps):
         for s in range(0, len(ids), batch_size):
             batch_ids = ids[s : s + batch_size]
             batch_embs = embs[s : s + batch_size]
             batch = Batch(ids=batch_ids, embs=batch_embs, texts=batch_ids)
+            t_step = time.perf_counter()
             res = trainer.step(batch)
+            step_times_ms.append((time.perf_counter() - t_step) * 1000.0)
             for k in total:
                 total[k] += getattr(res.stats, k)
+    total_wall_time_s = time.perf_counter() - t_run_start
 
     # Held-out: every (q, c) pair *not* committed as an edge.
     correct = 0
@@ -182,6 +201,12 @@ def _run_one(
             n_held += 1
             held_out_predictions[(q, c)] = (yhat, y_true)
 
+    mean_step_ms = float(np.mean(step_times_ms)) if step_times_ms else 0.0
+    p95_step_ms = float(np.percentile(step_times_ms, 95)) if step_times_ms else 0.0
+    time_per_judge_call_s = (
+        total_wall_time_s / total["judged"] if total["judged"] > 0 else 0.0
+    )
+
     return RunStats(
         label=label,
         seed=seed,
@@ -194,6 +219,10 @@ def _run_one(
         held_out_accuracy=correct / max(1, n_held),
         held_out_mae=abs_err_sum / max(1, n_held),
         held_out_n=n_held,
+        total_wall_time_s=total_wall_time_s,
+        mean_step_ms=mean_step_ms,
+        p95_step_ms=p95_step_ms,
+        time_per_judge_call_s=time_per_judge_call_s,
         held_out_predictions=held_out_predictions,
     )
 
@@ -208,6 +237,10 @@ KEYS = [
     "held_out_n",
     "held_out_accuracy",
     "held_out_mae",
+    "total_wall_time_s",
+    "mean_step_ms",
+    "p95_step_ms",
+    "time_per_judge_call_s",
 ]
 
 
@@ -221,16 +254,22 @@ def _summarise(runs: list[RunStats]) -> dict[str, tuple[float, float]]:
 
 
 def _print_table(rows: list[tuple[str, dict[str, tuple[float, float]]]]) -> None:
-    width_col = 18
-    header = "metric".ljust(24) + "".join(label.rjust(width_col) for label, _ in rows)
+    width_col = 20
+    header = "metric".ljust(28) + "".join(label.rjust(width_col) for label, _ in rows)
     print(header)
     print("-" * len(header))
     for k in KEYS:
-        row = k.ljust(24)
+        row = k.ljust(28)
         for _, summary in rows:
             mean, std = summary[k]
             if "accuracy" in k or "mae" in k:
                 cell = f"{mean:.3f}±{std:.3f}"
+            elif k == "total_wall_time_s":
+                cell = f"{mean:.2f}s±{std:.2f}"
+            elif "step_ms" in k:
+                cell = f"{mean:.1f}ms±{std:.1f}"
+            elif k == "time_per_judge_call_s":
+                cell = f"{mean*1000:.1f}ms±{std*1000:.1f}"
             else:
                 cell = f"{mean:.1f}±{std:.1f}"
             row += cell.rjust(width_col)
@@ -279,7 +318,8 @@ def main() -> None:
     print()
 
     base_runs: list[RunStats] = []
-    tgn_runs: list[RunStats] = []
+    imputer_runs: list[RunStats] = []
+    tgn_only_runs: list[RunStats] = []
     for seed in range(args.seeds):
         ids, embs, cluster_of = _build_world(
             seed=1000 + seed,
@@ -296,80 +336,93 @@ def main() -> None:
             judge_budget=args.judge_budget,
             judge_noise=args.judge_noise,
         )
-        base_runs.append(_run_one(label="baseline", seed=seed, use_tgn=False, **common))
-        tgn_runs.append(_run_one(label="tgn", seed=seed, use_tgn=True, **common))
+        base_runs.append(_run_one(label="baseline", seed=seed, engine="baseline", **common))
+        imputer_runs.append(_run_one(label="tgn_imputer", seed=seed, engine="tgn_imputer", **common))
+        tgn_only_runs.append(_run_one(label="tgn_only", seed=seed, engine="tgn_only", **common))
 
     base_summary = _summarise(base_runs)
-    tgn_summary = _summarise(tgn_runs)
-    _print_table([("baseline", base_summary), ("tgn", tgn_summary)])
+    imputer_summary = _summarise(imputer_runs)
+    tgn_only_summary = _summarise(tgn_only_runs)
+    _print_table([
+        ("baseline", base_summary),
+        ("tgn_imputer", imputer_summary),
+        ("tgn_only", tgn_only_summary),
+    ])
 
-    # Fair head-to-head: pairs *both* runs leave uncommitted.
+    # Fair head-to-head on the intersection of all three runs' held-out sets.
     print()
-    print("common held-out (pairs neither config committed):")
+    print("common held-out (pairs none of the three configs committed):")
     common_acc_base: list[float] = []
+    common_acc_imp: list[float] = []
     common_acc_tgn: list[float] = []
     common_mae_base: list[float] = []
+    common_mae_imp: list[float] = []
     common_mae_tgn: list[float] = []
     common_ns: list[int] = []
-    for b, t in zip(base_runs, tgn_runs):
-        common_keys = set(b.held_out_predictions) & set(t.held_out_predictions)
+    for b, i_, t in zip(base_runs, imputer_runs, tgn_only_runs):
+        common_keys = (
+            set(b.held_out_predictions) & set(i_.held_out_predictions) & set(t.held_out_predictions)
+        )
         if not common_keys:
             continue
         common_ns.append(len(common_keys))
-        b_corr = b_err = t_corr = t_err = 0
-        b_es = t_es = 0.0
+        b_corr = i_corr = t_corr = 0
+        b_es = i_es = t_es = 0.0
         for k in common_keys:
             yhb, yt = b.held_out_predictions[k]
+            yhi, _ = i_.held_out_predictions[k]
             yht, _ = t.held_out_predictions[k]
             if np.sign(yhb) == np.sign(yt) and abs(yhb) > 1e-6:
                 b_corr += 1
+            if np.sign(yhi) == np.sign(yt) and abs(yhi) > 1e-6:
+                i_corr += 1
             if np.sign(yht) == np.sign(yt) and abs(yht) > 1e-6:
                 t_corr += 1
             b_es += abs(yhb - yt)
+            i_es += abs(yhi - yt)
             t_es += abs(yht - yt)
         n = len(common_keys)
         common_acc_base.append(b_corr / n)
+        common_acc_imp.append(i_corr / n)
         common_acc_tgn.append(t_corr / n)
         common_mae_base.append(b_es / n)
+        common_mae_imp.append(i_es / n)
         common_mae_tgn.append(t_es / n)
+    if not common_ns:
+        print("  (no held-out pairs in common across all three configs)")
     if common_ns:
         print(f"  shared pairs (mean): {np.mean(common_ns):.1f}")
         print(
-            f"  baseline accuracy: {np.mean(common_acc_base):.3f}±{np.std(common_acc_base):.3f}"
+            f"  baseline    accuracy: {np.mean(common_acc_base):.3f}±{np.std(common_acc_base):.3f}   "
+            f"MAE: {np.mean(common_mae_base):.3f}±{np.std(common_mae_base):.3f}"
         )
         print(
-            f"  tgn      accuracy: {np.mean(common_acc_tgn):.3f}±{np.std(common_acc_tgn):.3f}"
+            f"  tgn_imputer accuracy: {np.mean(common_acc_imp):.3f}±{np.std(common_acc_imp):.3f}   "
+            f"MAE: {np.mean(common_mae_imp):.3f}±{np.std(common_mae_imp):.3f}"
         )
         print(
-            f"  baseline MAE:      {np.mean(common_mae_base):.3f}±{np.std(common_mae_base):.3f}"
-        )
-        print(
-            f"  tgn      MAE:      {np.mean(common_mae_tgn):.3f}±{np.std(common_mae_tgn):.3f}"
-        )
-        print(
-            f"  Δ accuracy (tgn-base): {np.mean(common_acc_tgn) - np.mean(common_acc_base):+.4f}"
-        )
-        print(
-            f"  Δ MAE      (tgn-base): {np.mean(common_mae_tgn) - np.mean(common_mae_base):+.4f}"
+            f"  tgn_only    accuracy: {np.mean(common_acc_tgn):.3f}±{np.std(common_acc_tgn):.3f}   "
+            f"MAE: {np.mean(common_mae_tgn):.3f}±{np.std(common_mae_tgn):.3f}"
         )
 
     print()
-    print("delta (tgn - baseline, mean only):")
+    print("deltas vs baseline (mean only):")
     for k in [
         "total_judged",
         "total_imputed",
-        "total_cached",
         "total_skipped",
         "n_committed_edges",
         "held_out_accuracy",
-        "held_out_mae",
+        "total_wall_time_s",
     ]:
-        d = tgn_summary[k][0] - base_summary[k][0]
-        sign = "+" if d >= 0 else ""
-        if "accuracy" in k or "mae" in k:
-            print(f"  {k}: {sign}{d:.4f}")
+        d_imp = imputer_summary[k][0] - base_summary[k][0]
+        d_tgn = tgn_only_summary[k][0] - base_summary[k][0]
+        if "accuracy" in k:
+            print(f"  {k:24s}  tgn_imputer {d_imp:+.4f}   tgn_only {d_tgn:+.4f}")
+        elif k == "total_wall_time_s":
+            print(f"  {k:24s}  tgn_imputer {d_imp:+.2f}s   tgn_only {d_tgn:+.2f}s")
         else:
-            print(f"  {k}: {sign}{d:.2f}")
+            print(f"  {k:24s}  tgn_imputer {d_imp:+.2f}    tgn_only {d_tgn:+.2f}")
 
 
 if __name__ == "__main__":

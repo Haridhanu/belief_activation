@@ -38,6 +38,7 @@ from multi_agent.benchmarks import Batch
 from multi_agent.config import MultiAgentConfig
 from multi_agent.judge import NLIJudge, StaticJudge
 from multi_agent.runner import Trainer
+from multi_agent.tgn_runner import TGNTrainer
 from multi_agent.utils.financebench import (
     FinanceBenchQuestion,
     load_financebench,
@@ -56,22 +57,28 @@ class RunSummary:
     total_skipped: int
     n_committed_edges: int
     held_out_predictions: dict[tuple[str, str], float]
+    total_wall_time_s: float
+    mean_step_ms: float
+    p95_step_ms: float
+    time_per_judge_call_s: float
 
 
 def _run(
     *,
     label: str,
-    use_tgn: bool,
+    engine: str,                 # "baseline" | "tgn_imputer" | "tgn_only"
     judge,
     batches: list[Batch],
     seed: int,
     epochs: int,
     judge_budget: int,
-) -> tuple[RunSummary, Trainer]:
+) -> tuple[RunSummary, Trainer | TGNTrainer]:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    use_tgn = engine == "tgn_imputer"
+    config_engine = "tgn_only" if engine == "tgn_only" else "psro"
     cfg = MultiAgentConfig(
         emb_dim=batches[0].embs.shape[1],
         num_agents=3,
@@ -84,29 +91,42 @@ def _run(
         },
         judge_budget_per_batch=judge_budget,
         use_tgn=use_tgn,
+        engine=config_engine,
         tgn_memory_dim=64,
         tgn_time_dim=16,
         tgn_n_attn_heads=2,
     )
-    trainer = Trainer(cfg, judge)
+    trainer: Trainer | TGNTrainer
+    if engine == "tgn_only":
+        trainer = TGNTrainer(cfg, judge)
+    else:
+        trainer = Trainer(cfg, judge)
 
     total = {"scorable": 0, "judged": 0, "imputed": 0, "cached": 0, "skipped": 0}
     losses: list[float] = []
-    for ep in range(epochs):
+    step_times_ms: list[float] = []
+    t_run = time.time()
+    for _ in range(epochs):
         for batch in batches:
+            t_step = time.perf_counter()
             res = trainer.step(batch)
+            step_times_ms.append((time.perf_counter() - t_step) * 1000.0)
             for k in total:
                 total[k] += getattr(res.stats, k)
-            if use_tgn:
+            if engine == "tgn_imputer":
                 losses.append(
-                    float(trainer.loop.last_step_stats.get("imputer_loss", 0.0))
+                    float(trainer.loop.last_step_stats.get("imputer_loss", 0.0))  # type: ignore[union-attr]
                 )
+            elif engine == "tgn_only":
+                losses.append(float(res.stats.loss))
+    total_wall_time_s = time.time() - t_run
 
-    if use_tgn and losses:
+    if losses and engine in ("tgn_imputer", "tgn_only"):
         head = np.mean(losses[: max(1, len(losses) // 3)])
         tail = np.mean(losses[-max(1, len(losses) // 3) :])
+        loss_label = "imputer_loss" if engine == "tgn_imputer" else "link_loss"
         print(
-            f"  imputer_loss head→tail: {head:.4f} → {tail:.4f}  "
+            f"  {loss_label} head→tail: {head:.4f} → {tail:.4f}  "
             f"(n_steps={len(losses)})"
         )
 
@@ -117,7 +137,17 @@ def _run(
         for c in nodes[i + 1 :]:
             if (q, c) in edge_keys or (c, q) in edge_keys:
                 continue
-            held[(q, c)] = float(trainer.graph.field(q, c))
+            if engine == "tgn_only":
+                # No graph.field equivalent — use TGN's predict_link directly.
+                held[(q, c)] = float(trainer.tgn.predict_link(q, c))  # type: ignore[union-attr]
+            else:
+                held[(q, c)] = float(trainer.graph.field(q, c))
+
+    mean_step_ms = float(np.mean(step_times_ms)) if step_times_ms else 0.0
+    p95_step_ms = float(np.percentile(step_times_ms, 95)) if step_times_ms else 0.0
+    time_per_judge_call_s = (
+        total_wall_time_s / total["judged"] if total["judged"] > 0 else 0.0
+    )
 
     return (
         RunSummary(
@@ -129,6 +159,10 @@ def _run(
             total_skipped=total["skipped"],
             n_committed_edges=len(trainer.graph._edges),
             held_out_predictions=held,
+            total_wall_time_s=total_wall_time_s,
+            mean_step_ms=mean_step_ms,
+            p95_step_ms=p95_step_ms,
+            time_per_judge_call_s=time_per_judge_call_s,
         ),
         trainer,
     )
@@ -216,44 +250,55 @@ def main() -> None:
     else:
         judge = StaticJudge(0.0)
 
-    print("Running BASELINE (use_tgn=False)…")
-    t0 = time.time()
-    base, base_trainer = _run(
+    print("Running BASELINE (engine=baseline)…")
+    base, _ = _run(
         label="baseline",
-        use_tgn=False,
+        engine="baseline",
         judge=judge,
         batches=batches,
         seed=args.seed,
         epochs=args.epochs,
         judge_budget=args.judge_budget,
     )
-    print(f"  baseline run: {time.time() - t0:.1f}s")
+    print(f"  baseline run: {base.total_wall_time_s:.1f}s")
     print()
 
-    print("Running TGN+BlendedImputer (use_tgn=True)…")
-    t0 = time.time()
-    tgn, tgn_trainer = _run(
-        label="tgn",
-        use_tgn=True,
+    print("Running TGN+BlendedImputer (engine=tgn_imputer)…")
+    imputer, _ = _run(
+        label="tgn_imputer",
+        engine="tgn_imputer",
         judge=judge,
         batches=batches,
         seed=args.seed,
         epochs=args.epochs,
         judge_budget=args.judge_budget,
     )
-    print(f"  tgn run: {time.time() - t0:.1f}s")
+    print(f"  tgn_imputer run: {imputer.total_wall_time_s:.1f}s")
     print()
 
-    print("=" * 72)
+    print("Running TGN-only (engine=tgn_only)…")
+    tgn_only, _ = _run(
+        label="tgn_only",
+        engine="tgn_only",
+        judge=judge,
+        batches=batches,
+        seed=args.seed,
+        epochs=args.epochs,
+        judge_budget=args.judge_budget,
+    )
+    print(f"  tgn_only run: {tgn_only.total_wall_time_s:.1f}s")
+    print()
+
+    print("=" * 88)
     print(f"FinanceBench {question.short_id} — {question.label}")
     print(f"{n_beliefs} beliefs, {len(batches)} batches × {args.epochs} epochs, "
           f"judge_budget={args.judge_budget}, seed={args.seed}")
-    print("=" * 72)
+    print("=" * 88)
     print()
 
-    width_col = 14
-    print("metric".ljust(24) + "baseline".rjust(width_col) + "tgn".rjust(width_col)
-          + "Δ".rjust(width_col))
+    runs = [("baseline", base), ("tgn_imputer", imputer), ("tgn_only", tgn_only)]
+    width_col = 16
+    print("metric".ljust(24) + "".join(label.rjust(width_col) for label, _ in runs))
     print("-" * (24 + width_col * 3))
     for k, label in [
         ("total_scorable", "scorable"),
@@ -262,49 +307,64 @@ def main() -> None:
         ("total_cached", "cached"),
         ("total_skipped", "skipped"),
         ("n_committed_edges", "edges"),
+        ("total_wall_time_s", "wall_time_s"),
+        ("mean_step_ms", "mean_step_ms"),
+        ("p95_step_ms", "p95_step_ms"),
+        ("time_per_judge_call_s", "s_per_judge_call"),
     ]:
-        b = getattr(base, k)
-        t = getattr(tgn, k)
-        d = t - b
-        sign = "+" if d >= 0 else ""
-        print(f"{label}".ljust(24) + f"{b}".rjust(width_col)
-              + f"{t}".rjust(width_col) + f"{sign}{d}".rjust(width_col))
+        row = label.ljust(24)
+        for _, r in runs:
+            v = getattr(r, k)
+            if "step_ms" in k:
+                row += f"{v:.1f}".rjust(width_col)
+            elif k == "total_wall_time_s":
+                row += f"{v:.1f}".rjust(width_col)
+            elif k == "time_per_judge_call_s":
+                row += f"{v:.3f}".rjust(width_col)
+            else:
+                row += f"{v}".rjust(width_col)
+        print(row)
     print()
 
     if args.gt_cap > 0 and args.judge == "nli":
-        common = set(base.held_out_predictions) & set(tgn.held_out_predictions)
+        common = (
+            set(base.held_out_predictions)
+            & set(imputer.held_out_predictions)
+            & set(tgn_only.held_out_predictions)
+        )
         print(
-            f"Common held-out: {len(common)} pairs. Sampling up to "
-            f"{args.gt_cap} for NLI ground-truth evaluation…"
+            f"Common held-out (all three configs): {len(common)} pairs. "
+            f"Sampling up to {args.gt_cap} for NLI ground-truth evaluation…"
         )
         t0 = time.time()
         gt = _ground_truth_via_nli(common, text_of, judge, args.gt_cap)
         print(f"  ground-truth eval: {time.time() - t0:.1f}s")
 
-        b_acc = t_acc = 0
-        b_mae = t_mae = 0.0
+        b_acc = i_acc = t_acc = 0
+        b_mae = i_mae = t_mae = 0.0
         n = 0
         for key, y_true in gt.items():
             y_b = base.held_out_predictions[key]
-            y_t = tgn.held_out_predictions[key]
+            y_i = imputer.held_out_predictions[key]
+            y_t = tgn_only.held_out_predictions[key]
             if abs(y_true) < 1e-3:
                 continue  # NLI ambiguous → skip
             n += 1
             if np.sign(y_b) == np.sign(y_true) and abs(y_b) > 1e-6:
                 b_acc += 1
+            if np.sign(y_i) == np.sign(y_true) and abs(y_i) > 1e-6:
+                i_acc += 1
             if np.sign(y_t) == np.sign(y_true) and abs(y_t) > 1e-6:
                 t_acc += 1
             b_mae += abs(y_b - y_true)
+            i_mae += abs(y_i - y_true)
             t_mae += abs(y_t - y_true)
         if n > 0:
             print()
             print(f"NLI-graded held-out (n={n}):")
-            print(f"  baseline   sign accuracy: {b_acc / n:.3f}   MAE: {b_mae / n:.3f}")
-            print(f"  tgn+imputer sign accuracy: {t_acc / n:.3f}   MAE: {t_mae / n:.3f}")
-            print(
-                f"  Δ accuracy: {(t_acc - b_acc) / n:+.4f}   "
-                f"Δ MAE: {(t_mae - b_mae) / n:+.4f}"
-            )
+            print(f"  baseline    sign accuracy: {b_acc / n:.3f}   MAE: {b_mae / n:.3f}")
+            print(f"  tgn_imputer sign accuracy: {i_acc / n:.3f}   MAE: {i_mae / n:.3f}")
+            print(f"  tgn_only    sign accuracy: {t_acc / n:.3f}   MAE: {t_mae / n:.3f}")
 
 
 if __name__ == "__main__":
