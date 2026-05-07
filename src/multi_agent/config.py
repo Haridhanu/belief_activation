@@ -54,8 +54,19 @@ class MultiAgentConfig:
     #   "tgn_only" : TGN-only active-learning trainer (no agents, no Bayes)
     engine: str = "psro"
     tgn_only_lr: float = 1e-3
-    tgn_only_commit_threshold: float = 0.5
+    # Lower threshold: link_head's Tanh output stays in roughly [-0.5, +0.5]
+    # for most of training because pre-Tanh activations are small. 0.5 was
+    # too conservative — the gate never opened. 0.2 lets confident-enough
+    # predictions commit, with calibration (below) refining further.
+    tgn_only_commit_threshold: float = 0.2
     tgn_only_candidate_k: int = 8
+    # Calibration-based commit gate: track |pred| vs sign-correctness over
+    # judged pairs; commit a predicted edge only when its magnitude lands
+    # in a regime where empirical sign accuracy meets `target_accuracy`.
+    # Falls back to `tgn_only_commit_threshold` until we have at least
+    # `warmup` calibration samples.
+    tgn_only_calibration_target: float = 0.7
+    tgn_only_calibration_warmup: int = 10
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MultiAgentConfig":

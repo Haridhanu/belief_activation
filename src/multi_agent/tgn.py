@@ -59,6 +59,15 @@ class NodeMemory:
     def set(self, node_id: str, memory: torch.Tensor) -> None:
         self._store[node_id] = memory.detach()
 
+    def set_no_detach(self, node_id: str, memory: torch.Tensor) -> None:
+        """Store memory tensor *without* detaching from the autograd graph.
+
+        Use only inside a training step where the caller will explicitly
+        call :py:meth:`TGNModule.detach_all_memory` after backward to
+        cut the graph at the step boundary.
+        """
+        self._store[node_id] = memory
+
     def get_batch(self, node_ids: list[str]) -> torch.Tensor:
         return torch.stack([self.get(nid) for nid in node_ids])
 
@@ -223,6 +232,77 @@ class TGNModule(nn.Module):
             [float(y) for _, _, y in pairs], dtype=torch.float32
         )
         return ((preds - targets) ** 2).mean()
+
+    def train_step(
+        self,
+        events: list[tuple[str, str, float, float, float, float]],
+    ) -> torch.Tensor:
+        """One training pass over a batch of judged events.
+
+        ``events`` is a list of ``(src, dst, sign, timestamp, edge_weight, y_truth)``
+        tuples processed in the order given. For each event:
+
+        1. The pair's prediction is computed from *pre-event* memory via
+           ``link_head``. Gradient flows through ``link_head`` and — if
+           prior events in this batch updated memory under autograd —
+           also through the message encoder and GRU updater of those
+           prior events.
+        2. The squared error ``(pred - y_truth)²`` is added to the loss.
+        3. Memory for both endpoints is updated under autograd. Storage
+           uses :py:meth:`NodeMemory.set_no_detach` so the autograd graph
+           stays alive for subsequent events in this batch.
+
+        Returns the mean loss as a 0-d tensor. The caller is responsible
+        for ``loss.backward()``, ``optimizer.step()``, and
+        :py:meth:`detach_all_memory` afterwards. The detach-after-storage
+        discipline confines BPTT to a single batch.
+
+        This replaces the old ``link_loss + update`` pattern as the
+        canonical training entry point — and is what actually trains the
+        message encoder + GRU updater (which were previously only
+        forward-applied, never gradient-updated).
+        """
+        if not events:
+            return torch.zeros((), requires_grad=True)
+
+        losses: list[torch.Tensor] = []
+        for src, dst, sign, timestamp, edge_weight, y_truth in events:
+            m_src = self.memory.get(src)
+            m_dst = self.memory.get(dst)
+
+            combined = torch.cat([m_src, m_dst])
+            pred = self.link_head(combined).squeeze(-1)
+            target = combined.new_tensor(float(y_truth))
+            losses.append((pred - target) ** 2)
+
+            delta_t = m_src.new_tensor(timestamp - self._ref_time)
+            time_enc = self.time_encoder(delta_t)
+            msg_for_dst = self.msg_encoder(
+                m_src, m_dst, sign, time_enc, edge_weight
+            )
+            msg_for_src = self.msg_encoder(
+                m_dst, m_src, sign, time_enc, edge_weight
+            )
+            new_m_dst = self.updater(msg_for_dst, m_dst)
+            new_m_src = self.updater(msg_for_src, m_src)
+
+            self.memory.set_no_detach(dst, new_m_dst)
+            self.memory.set_no_detach(src, new_m_src)
+            self._ref_time = timestamp
+
+        return torch.stack(losses).mean()
+
+    def detach_all_memory(self) -> None:
+        """Detach every stored memory tensor in place.
+
+        Called after ``loss.backward()`` and ``optimizer.step()`` to cut
+        the autograd graph at the step boundary so BPTT does not persist
+        across steps.
+        """
+        for node_id in list(self.memory._store.keys()):
+            v = self.memory._store[node_id]
+            if v.requires_grad:
+                self.memory._store[node_id] = v.detach()
 
     def reset(self) -> None:
         """Zero all memory. Call before processing a new question/session."""

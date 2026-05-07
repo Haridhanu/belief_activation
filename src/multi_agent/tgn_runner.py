@@ -66,6 +66,10 @@ class TGNTrainer:
         self.history: list[StepStats] = []
         self.debug_history: list[TGNStepDebug] = []
         self._step = 0
+        # Calibration log: (|prediction|, sign_correct) for every judged
+        # pair. Used by `_calibrated_commit_threshold` to gate predicted
+        # edges by empirical accuracy rather than a static cutoff.
+        self._calibration_log: list[tuple[float, bool]] = []
 
     # ----- Public API ------------------------------------------------------
 
@@ -104,20 +108,19 @@ class TGNTrainer:
         for pair, y in judged_results.items():
             self.score_cache[pair] = y
 
-        # Train link head on judge-revealed pairs (pre-update memory).
-        loss_value = self._train_link_head(judged_results)
+        # Record calibration before training so the curve reflects the
+        # model's own pre-training predictions vs the judge's truth.
+        self._record_calibration(preds, judged_results)
 
-        # Memory propagation for both endpoints of each judged edge.
-        for (u, v), y in judged_results.items():
-            sign = 1.0 if y > 0 else (-1.0 if y < 0 else 0.0)
-            self.tgn.update(
-                u, v,
-                sign=sign,
-                timestamp=float(self.graph._edge_count + 1),
-                edge_weight=float(y),
-            )
+        # Combined train + memory-propagation in a single autograd graph.
+        # Each event predicts from pre-event memory (no leakage) AND
+        # updates memory under autograd, so the next event's prediction
+        # backprops through the prior event's encoder + GRU. This is
+        # what actually trains the message encoder + GRU updater.
+        loss_value = self._train_and_propagate(judged_results)
 
-        # Commit edges: judged ones at judge_y, predicted ones above threshold.
+        # Commit edges: judged ones at judge_y, predicted ones above the
+        # calibration-aware confidence gate.
         committed = self._commit_edges(scorable, preds, judged_results, cached_pairs)
         if committed:
             self.graph.extend([], np.empty((0, batch.embs.shape[1]), dtype=batch.embs.dtype), committed)
@@ -234,20 +237,73 @@ class TGNTrainer:
             out[pair] = y
         return out
 
-    def _train_link_head(
+    def _train_and_propagate(
         self, judged: dict[tuple[str, str], float]
     ) -> float:
+        """One combined train + memory-update step over judged events.
+
+        Calls :py:meth:`TGNModule.train_step`, then ``backward()`` /
+        ``optimizer.step()``, then :py:meth:`TGNModule.detach_all_memory`
+        to cut the autograd graph at the step boundary.
+        """
         if not judged:
             return 0.0
-        triples = [(u, v, y) for (u, v), y in judged.items()]
+        # Build event tuples with monotonically increasing timestamps so
+        # the time encoder sees real progression within a step. We use
+        # the current edge counter as the base offset.
+        base_t = float(self.graph._edge_count) + 1.0
+        events: list[tuple[str, str, float, float, float, float]] = []
+        for i, ((u, v), y) in enumerate(judged.items()):
+            sign = 1.0 if y > 0 else (-1.0 if y < 0 else 0.0)
+            events.append((u, v, sign, base_t + i, abs(float(y)), float(y)))
+
         self.optimizer.zero_grad()
-        loss = self.tgn.link_loss(triples)
+        loss = self.tgn.train_step(events)
         if not loss.requires_grad:
+            self.tgn.detach_all_memory()
             return float(loss.item())
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.tgn.parameters(), max_norm=1.0)
         self.optimizer.step()
+        self.tgn.detach_all_memory()
         return float(loss.item())
+
+    def _record_calibration(
+        self,
+        predictions: dict[tuple[str, str], float],
+        judged: dict[tuple[str, str], float],
+    ) -> None:
+        """Append ``(|pred|, sign_correct)`` entries for every judged pair
+        whose ground-truth ``y`` is non-trivially signed."""
+        for pair, y_truth in judged.items():
+            if abs(y_truth) < 1e-6:
+                continue
+            pred = predictions.get(pair)
+            if pred is None:
+                continue
+            sign_correct = bool(np.sign(pred) == np.sign(y_truth) and abs(pred) > 1e-6)
+            self._calibration_log.append((abs(float(pred)), sign_correct))
+
+    def _calibrated_commit_threshold(self) -> float:
+        """Return the magnitude threshold above which empirical sign
+        accuracy meets ``tgn_only_calibration_target``. Falls back to the
+        static config threshold if the warmup hasn't accumulated enough
+        samples or no magnitude bin is accurate enough."""
+        cfg_threshold = float(self.config.tgn_only_commit_threshold)
+        target = float(self.config.tgn_only_calibration_target)
+        warmup = int(self.config.tgn_only_calibration_warmup)
+        if len(self._calibration_log) < warmup:
+            return cfg_threshold
+        # Find the smallest |pred| such that the empirical sign-accuracy
+        # of pairs at-or-above that magnitude meets the target.
+        sorted_log = sorted(self._calibration_log)
+        n = len(sorted_log)
+        for i in range(n):
+            above = sorted_log[i:]
+            acc = sum(1 for _, ok in above if ok) / len(above)
+            if acc >= target:
+                return float(sorted_log[i][0])
+        return cfg_threshold
 
     def _commit_edges(
         self,
@@ -256,7 +312,7 @@ class TGNTrainer:
         judged: dict[tuple[str, str], float],
         cached: dict[tuple[str, str], float],
     ) -> list[tuple[str, str, float]]:
-        threshold = float(self.config.tgn_only_commit_threshold)
+        threshold = self._calibrated_commit_threshold()
         out: list[tuple[str, str, float]] = []
         for (u, v), y in cached.items():
             out.append((u, v, float(y)))
