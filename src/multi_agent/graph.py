@@ -8,12 +8,32 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from multi_agent.imputation import BlendedImputer
     from multi_agent.tgn import TGNModule
 
 
 @dataclass
 class Graph:
+    """Belief graph with optional TGN substrate.
+
+    Two operating modes, controlled by the presence of an attached
+    :py:class:`TGNModule` (``self._tgn``):
+
+    1. **Bayesian baseline** (``_tgn is None``, default).
+       ``_z[id]`` holds a signed-attention-updated representation that
+       gets refreshed in :py:meth:`_update_representations` after every
+       new edge. ``impute`` / ``field`` use a Bayesian 2-hop posterior
+       over neighbour evidence.
+
+    2. **TGN substrate** (``_tgn`` attached).
+       ``candidate_reps`` come from the TGN's per-node memory (projected
+       to ``emb_dim`` via the trained ``mem_to_emb`` linear). The
+       signed-attention ``_z`` update is **not** run — the TGN owns
+       representation. ``impute`` / ``field`` delegate to
+       ``tgn.predict_link``. Memory propagation happens during PSRO's
+       train_step hook (see ``psro.PSROLoop.step``), not from
+       ``Graph.extend``.
+    """
+
     emb_dim: int = 768
     attention_step: float = 0.2
     prior_variance: float = 1.0
@@ -27,15 +47,17 @@ class Graph:
     _z_tensor: np.ndarray | None = None
     _z_index: dict[str, int] = field(default_factory=dict)
 
-    _tgn: TGNModule | None = field(default=None, repr=False)
+    _tgn: "TGNModule | None" = field(default=None, repr=False)
     _edge_count: int = field(default=0, init=False, repr=False)
     _edge_timestamps: dict[tuple[str, str], int] = field(
         default_factory=dict, init=False, repr=False
     )
-    tgn_blend: float = field(default=0.3, repr=False)
-    time_decay: float = field(default=0.1, repr=False)
-    baseline_norm: float = field(default=1.0, repr=False)
-    _imputer: "BlendedImputer | None" = field(default=None, repr=False)
+    # Cold-start mode for TGN substrate: "pure" (always project memory)
+    # or "raw_fallback" (use raw embedding for nodes with no memory yet).
+    tgn_cold_start: str = field(default="pure", repr=False)
+    # Confidence threshold for TGN-substrate impute() — below this, impute
+    # returns None and the pair escalates to the judge.
+    tgn_predict_threshold: float = field(default=0.2, repr=False)
 
     def __len__(self) -> int:
         return len(self._raw)
@@ -51,14 +73,53 @@ class Graph:
             for nid in self._adj[node_id]
         ]
 
+    # --- representations ---------------------------------------------------
+
+    def _has_tgn_memory(self, node_id: str) -> bool:
+        if self._tgn is None:
+            return False
+        mem = self._tgn.memory.get(node_id)
+        # NodeMemory.get returns zeros for unseen nodes; treat zeros as
+        # "memory has not yet been touched" (cold start).
+        import torch
+        return bool(torch.any(mem != 0.0).item())
+
+    def _candidate_rep(self, node_id: str) -> np.ndarray:
+        """Resolve the per-node representation that agents read.
+
+        - No TGN: the signed-attention-updated ``_z[node_id]``.
+        - TGN attached, memory cold (all-zeros) and ``tgn_cold_start="raw_fallback"``:
+          fall back to ``_raw[node_id]``.
+        - TGN attached otherwise: ``mem_to_emb(memory[node_id])`` projected.
+        """
+        if self._tgn is None:
+            return self._z[node_id]
+
+        if self.tgn_cold_start == "raw_fallback" and not self._has_tgn_memory(node_id):
+            return self._raw[node_id].astype(np.float32)
+
+        mem = self._tgn.get_memory([node_id])
+        proj = self._tgn.project_to_emb(mem)
+        return proj[0].detach().cpu().numpy().astype(np.float32)
+
     def get_representations_fast(self, node_ids: list[str]) -> np.ndarray:
-        """Batched read from a cached ``(N, emb_dim)`` tensor."""
-        if self._z_tensor is None:
-            all_ids = list(self._z.keys())
-            self._z_index = {nid: i for i, nid in enumerate(all_ids)}
-            self._z_tensor = np.stack([self._z[nid] for nid in all_ids])
-        rows = np.array([self._z_index[nid] for nid in node_ids])
-        return self._z_tensor[rows]
+        """Batched read of per-node candidate representations.
+
+        Cached as a single ``(N, emb_dim)`` tensor when no TGN is
+        attached. With TGN attached, recomputed per call from current
+        memory (this is cheap — one Linear forward per node).
+        """
+        if self._tgn is None:
+            if self._z_tensor is None:
+                all_ids = list(self._z.keys())
+                self._z_index = {nid: i for i, nid in enumerate(all_ids)}
+                self._z_tensor = np.stack([self._z[nid] for nid in all_ids])
+            rows = np.array([self._z_index[nid] for nid in node_ids])
+            return self._z_tensor[rows]
+
+        return np.stack([self._candidate_rep(nid) for nid in node_ids])
+
+    # --- streaming update --------------------------------------------------
 
     def extend(
         self,
@@ -66,6 +127,10 @@ class Graph:
         new_embs: np.ndarray,
         edges: list[tuple[str, str, float]],
     ) -> None:
+        """Add nodes + edges. With TGN attached, this only commits edge
+        bookkeeping — TGN memory is updated by ``PSROLoop.step`` via
+        ``tgn.train_step`` so the encoder + GRU can learn under autograd.
+        """
         touched: set[str] = set()
         for nid, emb in zip(new_ids, new_embs):
             if nid in self._raw:
@@ -84,15 +149,6 @@ class Graph:
                 self._edges[key] = float(w)
                 self._edge_count += 1
                 self._edge_timestamps[key] = self._edge_count
-                # Notify TGN of the new edge event
-                if self._tgn is not None:
-                    _sign = 1.0 if w > 0 else (-1.0 if w < 0 else 0.0)
-                    self._tgn.update(
-                        a, b,
-                        sign=_sign,
-                        timestamp=float(self._edge_count),
-                        edge_weight=float(w),
-                    )
                 touched.add(a)
                 touched.add(b)
         if touched:
@@ -100,6 +156,19 @@ class Graph:
             self._z_tensor = None
 
     def _update_representations(self, touched: set[str]) -> None:
+        """Refresh ``_z`` for touched nodes via signed attention.
+
+        With TGN attached this is a **no-op** — the TGN's memory IS the
+        representation, and is updated under autograd inside
+        ``PSROLoop.step``. We still keep ``_z`` populated with the most
+        recent projected memory so legacy readers (e.g. inference paths
+        that snapshot ``_z``) see fresh values.
+        """
+        if self._tgn is not None:
+            for v in touched:
+                if v in self._raw:
+                    self._z[v] = self._candidate_rep(v)
+            return
 
         updates: dict[str, np.ndarray] = {}
         for v in touched:
@@ -131,35 +200,18 @@ class Graph:
                 new_z = new_z / norm
             updates[v] = new_z
 
-        # TGN blend: mix projected memory into _z for touched nodes
-        if self._tgn is not None and touched:
-            touched_with_z = [v for v in touched if v in self._z]
-            if touched_with_z:
-                tgn_mems = self._tgn.get_memory(touched_with_z)       # (N, memory_dim)
-                projected = self._tgn.project_to_emb(tgn_mems)        # (N, emb_dim), detached
-                proj_np = projected.cpu().numpy().astype(np.float32)
-                for i, v in enumerate(touched_with_z):
-                    base = updates.get(v, self._z[v])
-                    tgn_contrib = proj_np[i]
-                    tc_norm = np.linalg.norm(tgn_contrib)
-                    if tc_norm > 0:
-                        tgn_contrib = tgn_contrib / tc_norm
-                    blended = (1.0 - self.tgn_blend) * base + self.tgn_blend * tgn_contrib
-                    b_norm = np.linalg.norm(blended)
-                    if b_norm > 0 and np.isfinite(b_norm):
-                        blended = blended / b_norm
-                    updates[v] = blended
-
         for v, new_z in updates.items():
             self._z[v] = new_z
 
+    # --- imputation --------------------------------------------------------
+
     def _prior(self, q: str, c: str) -> tuple[float, float, float]:
+        """Bayesian 2-hop posterior. Used only when no TGN is attached."""
         observed = self._edges.get(self._edge_key(q, c))
         if observed is not None:
             return observed, self.obs_variance, 1.0 / self.obs_variance
         numerator = 0.0
         sq_weight_sum = 0.0
-        current_t = self._edge_count
         for k, w_qk in self.get_neighbors(q):
             if k == c or k == q:
                 continue
@@ -167,26 +219,8 @@ class Graph:
             if y_kc is None:
                 continue
             w = float(w_qk)
-
-            if self._tgn is not None:
-                # Recency: decay by age of the oldest edge in the 2-hop path.
-                # A chain is only as fresh as its weakest link.
-                t_qk = self._edge_timestamps.get(self._edge_key(q, k), 0)
-                t_kc = self._edge_timestamps.get(self._edge_key(k, c), 0)
-                recency = math.exp(
-                    -self.time_decay * float(current_t - min(t_qk, t_kc))
-                )
-                # Memory reliability: a node with little history is a weak relay.
-                mem_norm = float(self._tgn.get_memory([k])[0].norm().item())
-                mem_weight = min(
-                    1.0, mem_norm / max(self.baseline_norm, 1e-8)
-                )
-                path_weight = recency * mem_weight * w
-            else:
-                path_weight = w
-
-            numerator += path_weight * y_kc
-            sq_weight_sum += path_weight * path_weight
+            numerator += w * y_kc
+            sq_weight_sum += w * w
         data_precision = sq_weight_sum / self.obs_variance
         total_precision = data_precision + 1.0 / self.prior_variance
         mu = (numerator / self.obs_variance) / total_precision
@@ -194,24 +228,42 @@ class Graph:
         return mu, var, data_precision
 
     def impute(self, q: str, c: str) -> float | None:
+        """Predict the signed weight of an unobserved edge ``(q, c)``,
+        or return ``None`` when confidence is below the floor.
+
+        Delegates to ``tgn.predict_link`` when a TGN is attached;
+        otherwise uses the Bayesian 2-hop posterior.
+        """
         if q == c:
             return None
-        if self._imputer is not None:
-            return self._imputer.impute(q, c)
+        observed = self._edges.get(self._edge_key(q, c))
+        if observed is not None:
+            return float(max(-1.0, min(1.0, observed)))
+
+        if self._tgn is not None:
+            score = float(self._tgn.predict_link(q, c))
+            if abs(score) < self.tgn_predict_threshold:
+                return None
+            return float(max(-1.0, min(1.0, score)))
+
         mu, _, data_precision = self._prior(q, c)
         if data_precision < self.confidence_floor:
             return None
         return float(max(-1.0, min(1.0, mu)))
 
     def field(self, q: str, c: str) -> float:
-        """Mean prediction for edge ``(q, c)``, always defined.
+        """Always-defined signed prediction in ``[-1, 1]``.
 
-        Delegates to the attached :py:class:`BlendedImputer` when one is
-        wired up; otherwise falls back to the Bayesian prior mean clamped to
-        ``[-1, 1]``.
+        Delegates to ``tgn.predict_link`` when a TGN is attached;
+        otherwise the Bayesian prior mean (clamped).
         """
-        if self._imputer is not None:
-            return self._imputer.field(q, c)
+        if q == c:
+            return 0.0
+        observed = self._edges.get(self._edge_key(q, c))
+        if observed is not None:
+            return float(max(-1.0, min(1.0, observed)))
+        if self._tgn is not None:
+            return float(max(-1.0, min(1.0, self._tgn.predict_link(q, c))))
         mu, _, _ = self._prior(q, c)
         return float(max(-1.0, min(1.0, mu)))
 

@@ -47,15 +47,21 @@ def test_config_tgn_defaults_to_disabled():
     assert cfg.use_tgn is False
     assert cfg.tgn_memory_dim == 128
     assert cfg.tgn_time_dim == 32
-    assert cfg.tgn_blend == 0.3
-    assert cfg.time_decay == 0.1
+    assert cfg.tgn_n_attn_heads == 4
+    assert cfg.tgn_lr == 1e-3
+    assert cfg.tgn_predict_threshold == 0.2
+    assert cfg.tgn_cold_start == "pure"
 
 
 def test_config_tgn_fields_survive_yaml_round_trip(tmp_path):
     import yaml
 
     cfg = MultiAgentConfig(
-        use_tgn=True, tgn_memory_dim=64, tgn_time_dim=16, tgn_blend=0.2, time_decay=0.05
+        use_tgn=True,
+        tgn_memory_dim=64,
+        tgn_time_dim=16,
+        tgn_predict_threshold=0.3,
+        tgn_cold_start="raw_fallback",
     )
     path = tmp_path / "cfg.yaml"
     path.write_text(
@@ -64,8 +70,8 @@ def test_config_tgn_fields_survive_yaml_round_trip(tmp_path):
                 "use_tgn": True,
                 "tgn_memory_dim": 64,
                 "tgn_time_dim": 16,
-                "tgn_blend": 0.2,
-                "time_decay": 0.05,
+                "tgn_predict_threshold": 0.3,
+                "tgn_cold_start": "raw_fallback",
             }
         )
     )
@@ -73,5 +79,5 @@ def test_config_tgn_fields_survive_yaml_round_trip(tmp_path):
     assert loaded.use_tgn is True
     assert loaded.tgn_memory_dim == 64
     assert loaded.tgn_time_dim == 16
-    assert loaded.tgn_blend == 0.2
-    assert loaded.time_decay == 0.05
+    assert loaded.tgn_predict_threshold == 0.3
+    assert loaded.tgn_cold_start == "raw_fallback"

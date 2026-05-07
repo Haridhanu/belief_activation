@@ -30,12 +30,19 @@ class PSROLoop:
         config: MultiAgentConfig,
         judge: Judge | None = None,
         graph: Graph | None = None,
+        tgn_optimizer: torch.optim.Optimizer | None = None,
     ) -> None:
         self.config = config
         self.step_count: int = 0
         self._optimizers: dict = {}
         self.judge: Judge = judge if judge is not None else StaticJudge(0.0)
         self._graph = graph
+        # Optional optimizer for the attached TGN. When provided alongside
+        # ``graph._tgn``, ``step`` will train the TGN's link head, message
+        # encoder, and GRU updater on every batch's judged pairs (see the
+        # ``train_step`` hook below). When None, TGN — if attached — stays
+        # forward-only.
+        self._tgn_optimizer = tgn_optimizer
         self.last_step_stats: dict[str, int] = {
             "imputed": 0,
             "judged": 0,
@@ -371,15 +378,35 @@ class PSROLoop:
             else []
         )
 
-        # Train the BlendedImputer's gate on judge-revealed pairs BEFORE
-        # extend, so it sees the pre-update graph state.
-        imputer_loss: float = 0.0
+        # Train the TGN's link head + message encoder + GRU updater on
+        # the judged events BEFORE extend, so memory propagation happens
+        # under autograd in train_step (not as a side effect of extend).
+        # This is the architectural hook that turns TGN from a passive
+        # observer into a co-trained reasoner.
+        tgn_loss: float = 0.0
         if (
             self._graph is not None
-            and getattr(self._graph, "_imputer", None) is not None
+            and self._graph._tgn is not None
+            and self._tgn_optimizer is not None
             and judged.judged_pairs
         ):
-            imputer_loss = self._graph._imputer.train_on_judged(judged.judged_pairs)
+            base_t = float(self._graph._edge_count) + 1.0
+            events: list[tuple[str, str, float, float, float, float]] = []
+            for i, ((u, v), y) in enumerate(judged.judged_pairs):
+                sign = 1.0 if y > 0 else (-1.0 if y < 0 else 0.0)
+                events.append(
+                    (u, v, sign, base_t + i, abs(float(y)), float(y))
+                )
+            self._tgn_optimizer.zero_grad()
+            loss = self._graph._tgn.train_step(events)
+            if loss.requires_grad:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self._graph._tgn.parameters(), max_norm=1.0
+                )
+                self._tgn_optimizer.step()
+            self._graph._tgn.detach_all_memory()
+            tgn_loss = float(loss.item())
 
         # Post-judge impute: now that q has its first neighborhood (from
         # the judged edges), re-impute any pairs we skipped for budget.
@@ -394,7 +421,7 @@ class PSROLoop:
             "meta_rewards": meta_rewards,
             "sigma": self.sigma,
             "field_revealed": field_revealed,
-            "imputer_loss": imputer_loss,
+            "tgn_loss": tgn_loss,
         }
         return self._results(query_ids, agents, batch.by_agent, score_by_pair, rewards)
 

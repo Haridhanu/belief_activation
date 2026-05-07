@@ -159,6 +159,7 @@ class Trainer:
         self.population = AgentPopulation(config)
 
         tgn = None
+        tgn_optimizer: torch.optim.Optimizer | None = None
         if config.use_tgn:
             from multi_agent.tgn import TGNModule
 
@@ -168,25 +169,20 @@ class Trainer:
                 time_dim=config.tgn_time_dim,
                 n_heads=config.tgn_n_attn_heads,
             )
+            tgn_optimizer = torch.optim.Adam(tgn.parameters(), lr=config.tgn_lr)
 
         self.graph = Graph(
             emb_dim=config.emb_dim,
             _tgn=tgn,
-            tgn_blend=config.tgn_blend,
-            time_decay=config.time_decay,
-            baseline_norm=config.baseline_norm,
+            tgn_cold_start=config.tgn_cold_start,
+            tgn_predict_threshold=config.tgn_predict_threshold,
         )
+        self.tgn = tgn
+        self.tgn_optimizer = tgn_optimizer
 
-        if config.use_tgn:
-            from multi_agent.imputation import BlendedImputer
-
-            self.graph._imputer = BlendedImputer(
-                graph=self.graph,
-                tgn=tgn,
-                lr=config.impute_blend_lr,
-            )
-
-        self.loop = PSROLoop(config, judge=judge, graph=self.graph)
+        self.loop = PSROLoop(
+            config, judge=judge, graph=self.graph, tgn_optimizer=tgn_optimizer
+        )
         self.score_cache: dict[tuple[str, str], float] = {}
         self.node_texts: dict[str, str] = {}
         self.history: list[StepStats] = []

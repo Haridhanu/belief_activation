@@ -38,7 +38,6 @@ from multi_agent.benchmarks import Batch
 from multi_agent.config import MultiAgentConfig
 from multi_agent.judge import NLIJudge, StaticJudge
 from multi_agent.runner import Trainer
-from multi_agent.tgn_runner import TGNTrainer
 from multi_agent.utils.financebench import (
     FinanceBenchQuestion,
     load_financebench,
@@ -66,19 +65,19 @@ class RunSummary:
 def _run(
     *,
     label: str,
-    engine: str,                 # "baseline" | "tgn_imputer" | "tgn_only"
+    engine: str,            # "baseline" | "tgn_pure" | "tgn_raw_fallback"
     judge,
     batches: list[Batch],
     seed: int,
     epochs: int,
     judge_budget: int,
-) -> tuple[RunSummary, Trainer | TGNTrainer]:
+) -> tuple[RunSummary, Trainer]:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    use_tgn = engine == "tgn_imputer"
-    config_engine = "tgn_only" if engine == "tgn_only" else "psro"
+    use_tgn = engine in ("tgn_pure", "tgn_raw_fallback")
+    cold_start = "raw_fallback" if engine == "tgn_raw_fallback" else "pure"
     cfg = MultiAgentConfig(
         emb_dim=batches[0].embs.shape[1],
         num_agents=3,
@@ -91,16 +90,12 @@ def _run(
         },
         judge_budget_per_batch=judge_budget,
         use_tgn=use_tgn,
-        engine=config_engine,
+        tgn_cold_start=cold_start,
         tgn_memory_dim=64,
         tgn_time_dim=16,
         tgn_n_attn_heads=2,
     )
-    trainer: Trainer | TGNTrainer
-    if engine == "tgn_only":
-        trainer = TGNTrainer(cfg, judge)
-    else:
-        trainer = Trainer(cfg, judge)
+    trainer = Trainer(cfg, judge)
 
     total = {"scorable": 0, "judged": 0, "imputed": 0, "cached": 0, "skipped": 0}
     losses: list[float] = []
@@ -113,23 +108,22 @@ def _run(
             step_times_ms.append((time.perf_counter() - t_step) * 1000.0)
             for k in total:
                 total[k] += getattr(res.stats, k)
-            if engine == "tgn_imputer":
+            if use_tgn:
                 losses.append(
-                    float(trainer.loop.last_step_stats.get("imputer_loss", 0.0))  # type: ignore[union-attr]
+                    float(trainer.loop.last_step_stats.get("tgn_loss", 0.0))
                 )
-            elif engine == "tgn_only":
-                losses.append(float(res.stats.loss))
     total_wall_time_s = time.time() - t_run
 
-    if losses and engine in ("tgn_imputer", "tgn_only"):
+    if losses and use_tgn:
         head = np.mean(losses[: max(1, len(losses) // 3)])
         tail = np.mean(losses[-max(1, len(losses) // 3) :])
-        loss_label = "imputer_loss" if engine == "tgn_imputer" else "link_loss"
         print(
-            f"  {loss_label} head→tail: {head:.4f} → {tail:.4f}  "
+            f"  tgn_loss head→tail: {head:.4f} → {tail:.4f}  "
             f"(n_steps={len(losses)})"
         )
 
+    # Held-out predictions for every uncommitted pair, via graph.field
+    # (which delegates to tgn.predict_link when TGN is attached).
     held: dict[tuple[str, str], float] = {}
     edge_keys = set(trainer.graph._edges.keys())
     nodes = trainer.graph.get_nodes()
@@ -137,11 +131,7 @@ def _run(
         for c in nodes[i + 1 :]:
             if (q, c) in edge_keys or (c, q) in edge_keys:
                 continue
-            if engine == "tgn_only":
-                # No graph.field equivalent — use TGN's predict_link directly.
-                held[(q, c)] = float(trainer.tgn.predict_link(q, c))  # type: ignore[union-attr]
-            else:
-                held[(q, c)] = float(trainer.graph.field(q, c))
+            held[(q, c)] = float(trainer.graph.field(q, c))
 
     mean_step_ms = float(np.mean(step_times_ms)) if step_times_ms else 0.0
     p95_step_ms = float(np.percentile(step_times_ms, 95)) if step_times_ms else 0.0
@@ -263,30 +253,30 @@ def main() -> None:
     print(f"  baseline run: {base.total_wall_time_s:.1f}s")
     print()
 
-    print("Running TGN+BlendedImputer (engine=tgn_imputer)…")
-    imputer, _ = _run(
-        label="tgn_imputer",
-        engine="tgn_imputer",
+    print("Running TGN-pure (engine=tgn_pure)…")
+    pure, _ = _run(
+        label="tgn_pure",
+        engine="tgn_pure",
         judge=judge,
         batches=batches,
         seed=args.seed,
         epochs=args.epochs,
         judge_budget=args.judge_budget,
     )
-    print(f"  tgn_imputer run: {imputer.total_wall_time_s:.1f}s")
+    print(f"  tgn_pure run: {pure.total_wall_time_s:.1f}s")
     print()
 
-    print("Running TGN-only (engine=tgn_only)…")
-    tgn_only, _ = _run(
-        label="tgn_only",
-        engine="tgn_only",
+    print("Running TGN-raw_fallback (engine=tgn_raw_fallback)…")
+    raw_fb, _ = _run(
+        label="tgn_raw_fallback",
+        engine="tgn_raw_fallback",
         judge=judge,
         batches=batches,
         seed=args.seed,
         epochs=args.epochs,
         judge_budget=args.judge_budget,
     )
-    print(f"  tgn_only run: {tgn_only.total_wall_time_s:.1f}s")
+    print(f"  tgn_raw_fallback run: {raw_fb.total_wall_time_s:.1f}s")
     print()
 
     print("=" * 88)
@@ -296,7 +286,7 @@ def main() -> None:
     print("=" * 88)
     print()
 
-    runs = [("baseline", base), ("tgn_imputer", imputer), ("tgn_only", tgn_only)]
+    runs = [("baseline", base), ("tgn_pure", pure), ("tgn_raw_fb", raw_fb)]
     width_col = 16
     print("metric".ljust(24) + "".join(label.rjust(width_col) for label, _ in runs))
     print("-" * (24 + width_col * 3))
@@ -329,8 +319,8 @@ def main() -> None:
     if args.gt_cap > 0 and args.judge == "nli":
         common = (
             set(base.held_out_predictions)
-            & set(imputer.held_out_predictions)
-            & set(tgn_only.held_out_predictions)
+            & set(pure.held_out_predictions)
+            & set(raw_fb.held_out_predictions)
         )
         print(
             f"Common held-out (all three configs): {len(common)} pairs. "
@@ -340,31 +330,31 @@ def main() -> None:
         gt = _ground_truth_via_nli(common, text_of, judge, args.gt_cap)
         print(f"  ground-truth eval: {time.time() - t0:.1f}s")
 
-        b_acc = i_acc = t_acc = 0
-        b_mae = i_mae = t_mae = 0.0
+        b_acc = p_acc = r_acc = 0
+        b_mae = p_mae = r_mae = 0.0
         n = 0
         for key, y_true in gt.items():
             y_b = base.held_out_predictions[key]
-            y_i = imputer.held_out_predictions[key]
-            y_t = tgn_only.held_out_predictions[key]
+            y_p = pure.held_out_predictions[key]
+            y_r = raw_fb.held_out_predictions[key]
             if abs(y_true) < 1e-3:
                 continue  # NLI ambiguous → skip
             n += 1
             if np.sign(y_b) == np.sign(y_true) and abs(y_b) > 1e-6:
                 b_acc += 1
-            if np.sign(y_i) == np.sign(y_true) and abs(y_i) > 1e-6:
-                i_acc += 1
-            if np.sign(y_t) == np.sign(y_true) and abs(y_t) > 1e-6:
-                t_acc += 1
+            if np.sign(y_p) == np.sign(y_true) and abs(y_p) > 1e-6:
+                p_acc += 1
+            if np.sign(y_r) == np.sign(y_true) and abs(y_r) > 1e-6:
+                r_acc += 1
             b_mae += abs(y_b - y_true)
-            i_mae += abs(y_i - y_true)
-            t_mae += abs(y_t - y_true)
+            p_mae += abs(y_p - y_true)
+            r_mae += abs(y_r - y_true)
         if n > 0:
             print()
             print(f"NLI-graded held-out (n={n}):")
-            print(f"  baseline    sign accuracy: {b_acc / n:.3f}   MAE: {b_mae / n:.3f}")
-            print(f"  tgn_imputer sign accuracy: {i_acc / n:.3f}   MAE: {i_mae / n:.3f}")
-            print(f"  tgn_only    sign accuracy: {t_acc / n:.3f}   MAE: {t_mae / n:.3f}")
+            print(f"  baseline         sign accuracy: {b_acc / n:.3f}   MAE: {b_mae / n:.3f}")
+            print(f"  tgn_pure         sign accuracy: {p_acc / n:.3f}   MAE: {p_mae / n:.3f}")
+            print(f"  tgn_raw_fallback sign accuracy: {r_acc / n:.3f}   MAE: {r_mae / n:.3f}")
 
 
 if __name__ == "__main__":

@@ -39,34 +39,25 @@ class MultiAgentConfig:
 
     agent_roles: dict[str, str] | None = None
 
-    # TGN extension (all default to safe no-op values)
+    # TGN integration: when use_tgn=True the TGN replaces the Bayesian
+    # graph machinery. Agents continue to score (query, candidate) via
+    # their attention + MLP heads, but `candidate_reps` come from the
+    # TGN's projected memory (instead of the signed-attention `_z`),
+    # and `Graph.impute` / `Graph.field` delegate to `tgn.predict_link`.
+    # All defaults below are no-ops when use_tgn=False.
     use_tgn: bool = False
     tgn_memory_dim: int = 128
     tgn_time_dim: int = 32
     tgn_n_attn_heads: int = 4
-    tgn_blend: float = 0.3
-    time_decay: float = 0.1
-    baseline_norm: float = 1.0
-    impute_blend_lr: float = 1e-3
+    tgn_lr: float = 1e-3
+    tgn_predict_threshold: float = 0.2
 
-    # Engine selector — picks the inner training loop:
-    #   "psro"     : current multi-agent + PSRO trainer (default, unchanged)
-    #   "tgn_only" : TGN-only active-learning trainer (no agents, no Bayes)
-    engine: str = "psro"
-    tgn_only_lr: float = 1e-3
-    # Lower threshold: link_head's Tanh output stays in roughly [-0.5, +0.5]
-    # for most of training because pre-Tanh activations are small. 0.5 was
-    # too conservative — the gate never opened. 0.2 lets confident-enough
-    # predictions commit, with calibration (below) refining further.
-    tgn_only_commit_threshold: float = 0.2
-    tgn_only_candidate_k: int = 8
-    # Calibration-based commit gate: track |pred| vs sign-correctness over
-    # judged pairs; commit a predicted edge only when its magnitude lands
-    # in a regime where empirical sign accuracy meets `target_accuracy`.
-    # Falls back to `tgn_only_commit_threshold` until we have at least
-    # `warmup` calibration samples.
-    tgn_only_calibration_target: float = 0.7
-    tgn_only_calibration_warmup: int = 10
+    # Cold-start handling — "pure" (option C) always uses
+    # mem_to_emb(memory) as the candidate representation, even when memory
+    # is all-zeros at session start. "raw_fallback" (option A) uses the
+    # raw embedding for nodes whose memory has not yet been touched by
+    # any event, then switches to projected memory once any event fires.
+    tgn_cold_start: str = "pure"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MultiAgentConfig":
