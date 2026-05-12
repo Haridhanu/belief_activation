@@ -1,0 +1,11 @@
+# Core deps (already in pyproject.toml)
+torch>=2.0
+transformers>=4.40
+numpy>=1.26
+
+# Optional: PDF extraction
+pypdf>=4.0
+
+# Optional: plotting
+matplotlib>=3.7
+scikit-learn>=1.3
