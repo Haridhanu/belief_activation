@@ -1307,7 +1307,9 @@ notebook = [
     { name = "datasets" },
     { name = "ipykernel" },
     { name = "matplotlib" },
+    { name = "networkx" },
     { name = "pandas" },
+    { name = "scikit-learn" },
     { name = "sentence-transformers" },
 ]
 
@@ -1326,7 +1328,9 @@ notebook = [
     { name = "datasets", specifier = ">=4.8.5" },
     { name = "ipykernel", specifier = ">=6.0" },
     { name = "matplotlib", specifier = ">=3.7" },
+    { name = "networkx", specifier = ">=3.6.1" },
     { name = "pandas", specifier = ">=2.0" },
+    { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "sentence-transformers", specifier = ">=2.0" },
 ]
 
