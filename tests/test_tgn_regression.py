@@ -12,7 +12,6 @@ import torch
 
 from multi_agent.graph import Graph
 
-
 EMB_DIM = 32
 SEED = 42
 
@@ -73,9 +72,9 @@ def test_field_identical_without_tgn():
         for c in ids:
             if q == c:
                 continue
-            assert g_ref.field(q, c) == g_new.field(q, c), (
-                f"field({q},{c}) differs without TGN"
-            )
+            assert g_ref.field(q, c) == g_new.field(
+                q, c
+            ), f"field({q},{c}) differs without TGN"
 
 
 def test_info_gain_identical_without_tgn():

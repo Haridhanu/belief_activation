@@ -186,7 +186,7 @@ class Trainer:
                 memory_dim=config.tgn_memory_dim,
                 time_dim=config.tgn_time_dim,
                 n_heads=config.tgn_n_attn_heads,
-            )
+            ).to(torch.device(config.device))
             tgn_optimizer = torch.optim.Adam(tgn.parameters(), lr=config.tgn_lr)
 
         self.graph = Graph(

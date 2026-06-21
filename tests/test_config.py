@@ -50,7 +50,7 @@ def test_config_tgn_defaults_to_disabled():
     assert cfg.tgn_n_attn_heads == 4
     assert cfg.tgn_lr == 1e-3
     assert cfg.tgn_predict_threshold == 0.2
-    assert cfg.tgn_cold_start == "pure"
+    assert cfg.tgn_cold_start == "raw_fallback"
 
 
 def test_config_tgn_fields_survive_yaml_round_trip(tmp_path):

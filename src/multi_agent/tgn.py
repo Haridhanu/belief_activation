@@ -95,14 +95,16 @@ class NodeMemory:
     def set_no_detach(self, node_id: str, memory: torch.Tensor) -> None:
         """Store memory tensor *without* detaching from the autograd graph.
 
-        Use only inside a training step where the caller will explicitly
-        call :py:meth:`TGNModule.detach_all_memory` after backward to
-        cut the graph at the step boundary.
+        Use only inside a training step where the caller will explicitly call
+        :py:meth:`TGNModule.detach_all_memory` after backward to cut the graph
+        at the step boundary.
         """
         self._store[node_id] = memory
 
-    def get_batch(self, node_ids: list[str]) -> torch.Tensor:
-        return torch.stack([self.get(nid) for nid in node_ids])
+    def get_batch(
+        self, node_ids: list[str], device: torch.device | None = None
+    ) -> torch.Tensor:
+        return torch.stack([self.get(nid, device=device) for nid in node_ids])
 
     def reset(self) -> None:
         self._store.clear()
@@ -222,8 +224,6 @@ class TGNModule(nn.Module):
         # Projects memory → belief embedding space for _z blending
         self.mem_to_emb = nn.Linear(memory_dim, emb_dim)
         # Link predictor head: concat(mem_i, mem_j) → signed score in [-1, 1].
-        # Trainable end-to-end via ``link_loss``; replaces the legacy
-        # untrained sigmoid head.
         self.link_head = nn.Sequential(
             nn.Linear(memory_dim * 2, memory_dim),
             nn.ReLU(),
@@ -323,111 +323,187 @@ class TGNModule(nn.Module):
         with torch.no_grad():
             return self.mem_to_emb(memories.to(self.device))
 
-    def predict_link(self, src_id: str, dst_id: str) -> float:
-        """Trained signed score for edge (src, dst) in ``[-1, 1]``.
+    def _enrich_with_neighbors(
+        self,
+        mem: torch.Tensor,
+        nbr_mems: "torch.Tensor | None",
+    ) -> torch.Tensor:
+        """Attend over neighbour memories via the PyG aggregator.
 
-        Forward pass through ``link_head``. Detached — for inference. Use
-        :py:meth:`predict_link_grad` when you need gradient (e.g. inside
-        :py:meth:`link_loss`).
+        ``None``/empty neighbours → return ``mem`` unchanged (cold node /
+        degree-0): a transparent no-op, backward compatible.
         """
-        combined = torch.cat([self.memory.get(src_id), self.memory.get(dst_id)])
+        if nbr_mems is None or nbr_mems.shape[0] == 0:
+            return mem
+        return self.aggregator(mem, nbr_mems.to(mem.device))
+
+    def representation_alignment_loss(
+        self, node_ids: list[str], raw_embs: torch.Tensor
+    ) -> torch.Tensor:
+        """Align projected memory with raw embedding coordinates (cosine)."""
+        if not node_ids:
+            return next(self.parameters()).new_zeros((), requires_grad=True)
+        if raw_embs.ndim != 2 or raw_embs.shape[0] != len(node_ids):
+            raise ValueError(
+                "raw_embs must have shape (len(node_ids), emb_dim); "
+                f"got {tuple(raw_embs.shape)} for {len(node_ids)} nodes"
+            )
+        if raw_embs.shape[1] != self.emb_dim:
+            raise ValueError(
+                f"raw_embs width {raw_embs.shape[1]} does not match emb_dim {self.emb_dim}"
+            )
+        memories = self.get_memory(node_ids).detach()
+        projected = F.normalize(self.mem_to_emb(memories), dim=1, eps=1e-8)
+        raw = F.normalize(raw_embs.to(self.device), dim=1, eps=1e-8)
+        return (1.0 - (projected * raw).sum(dim=1)).mean()
+
+    # --- link prediction ---------------------------------------------------
+
+    def predict_link(
+        self,
+        src_id: str,
+        dst_id: str,
+        nbr_mems_src: "torch.Tensor | None" = None,
+        nbr_mems_dst: "torch.Tensor | None" = None,
+    ) -> float:
+        """Trained signed score for edge (src, dst) in ``[-1, 1]`` (detached).
+
+        When neighbour memories are supplied each endpoint is enriched via the
+        aggregator first; otherwise stored pairwise memory is used directly.
+        """
+        device = self.device
+        m_src = self.memory.get(src_id, device=device)
+        m_dst = self.memory.get(dst_id, device=device)
         with torch.no_grad():
+            m_src = self._enrich_with_neighbors(m_src, nbr_mems_src)
+            m_dst = self._enrich_with_neighbors(m_dst, nbr_mems_dst)
+            combined = torch.cat([m_src, m_dst])
             return float(self.link_head(combined).item())
 
-    def predict_link_grad(self, src_id: str, dst_id: str) -> torch.Tensor:
-        """Same as :py:meth:`predict_link` but with autograd enabled.
-
-        Returns a 0-d tensor in ``[-1, 1]``. Memory tensors are detached on
-        store, so gradient stops at the boundary — only ``link_head``'s
-        parameters receive grad through this call.
-        """
-        combined = torch.cat([self.memory.get(src_id), self.memory.get(dst_id)])
+    def predict_link_grad(
+        self,
+        src_id: str,
+        dst_id: str,
+        nbr_mems_src: "torch.Tensor | None" = None,
+        nbr_mems_dst: "torch.Tensor | None" = None,
+    ) -> torch.Tensor:
+        """Same as :py:meth:`predict_link` but with autograd enabled."""
+        device = self.device
+        m_src = self.memory.get(src_id, device=device)
+        m_dst = self.memory.get(dst_id, device=device)
+        m_src = self._enrich_with_neighbors(m_src, nbr_mems_src)
+        m_dst = self._enrich_with_neighbors(m_dst, nbr_mems_dst)
+        combined = torch.cat([m_src, m_dst])
         return self.link_head(combined).squeeze(-1)
 
-    def link_loss(
-        self, pairs: list[tuple[str, str, float]]
-    ) -> torch.Tensor:
-        """MSE between predicted signed link strength and judge ``y``.
+    def predict_links(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Batched signed scores for many pairs (detached, in ``[-1, 1]``).
 
-        ``pairs`` is a list of ``(src_id, dst_id, y_target)``. Returns a
-        scalar Tensor suitable for ``.backward()``. Empty list → 0-tensor.
+        One whole-graph conv pass enriches every node from the ``edge_index``
+        data index, then a single ``link_head`` forward scores all pairs.
+        Nodes without memory contribute zeros (callers gate cold pairs).
         """
         if not pairs:
-            return torch.zeros((), requires_grad=True)
+            return []
+        with torch.no_grad():
+            index, enriched = self._enriched_all()
+            zero = torch.zeros(self.memory_dim, device=self.device)
+            src_rows = torch.stack(
+                [enriched[index[s]] if s in index else zero for s, _ in pairs]
+            )
+            dst_rows = torch.stack(
+                [enriched[index[d]] if d in index else zero for _, d in pairs]
+            )
+            combined = torch.cat([src_rows, dst_rows], dim=1)  # (B, 2*memory_dim)
+            scores = self.link_head(combined).squeeze(-1).clamp(-1.0, 1.0)
+            return scores.tolist()
+
+    def link_loss(
+        self,
+        pairs: list[tuple[str, str, float]],
+        nbr_mems_by_node: "dict[str, torch.Tensor] | None" = None,
+    ) -> torch.Tensor:
+        """MSE between predicted signed link strength and judge ``y``."""
+        if not pairs:
+            return next(self.parameters()).new_zeros((), requires_grad=True)
         preds = torch.stack(
-            [self.predict_link_grad(s, d) for s, d, _ in pairs]
+            [
+                self.predict_link_grad(
+                    s,
+                    d,
+                    nbr_mems_src=(nbr_mems_by_node.get(s) if nbr_mems_by_node else None),
+                    nbr_mems_dst=(nbr_mems_by_node.get(d) if nbr_mems_by_node else None),
+                )
+                for s, d, _ in pairs
+            ]
         )
-        targets = torch.tensor(
-            [float(y) for _, _, y in pairs], dtype=torch.float32
-        )
+        targets = preds.new_tensor([float(y) for _, _, y in pairs])
         return ((preds - targets) ** 2).mean()
 
     def train_step(
         self,
         events: list[tuple[str, str, float, float, float, float]],
+        nbr_ids_by_node: "dict[str, list[str]] | None" = None,
+        max_bptt_events: int = 32,
     ) -> torch.Tensor:
         """One training pass over a batch of judged events.
 
-        ``events`` is a list of ``(src, dst, sign, timestamp, edge_weight, y_truth)``
-        tuples processed in the order given. For each event:
-
-        1. The pair's prediction is computed from *pre-event* memory via
-           ``link_head``. Gradient flows through ``link_head`` and — if
-           prior events in this batch updated memory under autograd —
-           also through the message encoder and GRU updater of those
-           prior events.
-        2. The squared error ``(pred - y_truth)²`` is added to the loss.
-        3. Memory for both endpoints is updated under autograd. Storage
-           uses :py:meth:`NodeMemory.set_no_detach` so the autograd graph
-           stays alive for subsequent events in this batch.
-
-        Returns the mean loss as a 0-d tensor. The caller is responsible
-        for ``loss.backward()``, ``optimizer.step()``, and
-        :py:meth:`detach_all_memory` afterwards. The detach-after-storage
-        discipline confines BPTT to a single batch.
-
-        This replaces the old ``link_loss + update`` pattern as the
-        canonical training entry point — and is what actually trains the
-        message encoder + GRU updater (which were previously only
-        forward-applied, never gradient-updated).
+        ``events`` is ``(src, dst, sign, timestamp, edge_weight, y_truth)`` in
+        order. For each event: predict from *pre-event* memory (optionally
+        neighbourhood-enriched), accumulate squared error, then update both
+        endpoints' memory under autograd and commit the edge to the data index.
+        Returns the mean loss; caller does backward/step/detach.
         """
         if not events:
-            return torch.zeros((), requires_grad=True)
+            return next(self.parameters()).new_zeros((), requires_grad=True)
 
         losses: list[torch.Tensor] = []
-        for src, dst, sign, timestamp, edge_weight, y_truth in events:
-            m_src = self.memory.get(src)
-            m_dst = self.memory.get(dst)
+        device = self.device
 
-            combined = torch.cat([m_src, m_dst])
+        def _lookup_nbr_mems(node_id: str) -> "torch.Tensor | None":
+            if not nbr_ids_by_node:
+                return None
+            ids = nbr_ids_by_node.get(node_id)
+            if not ids:
+                return None
+            return self.memory.get_batch(ids, device=device)
+
+        for idx, (src, dst, sign, timestamp, edge_weight, y_truth) in enumerate(
+            events, start=1
+        ):
+            m_src = self.memory.get(src, device=device)
+            m_dst = self.memory.get(dst, device=device)
+
+            nbr_src = _lookup_nbr_mems(src)
+            nbr_dst = _lookup_nbr_mems(dst)
+            m_src_ctx = self._enrich_with_neighbors(m_src, nbr_src)
+            m_dst_ctx = self._enrich_with_neighbors(m_dst, nbr_dst)
+
+            combined = torch.cat([m_src_ctx, m_dst_ctx])
             pred = self.link_head(combined).squeeze(-1)
             target = combined.new_tensor(float(y_truth))
             losses.append((pred - target) ** 2)
 
             delta_t = m_src.new_tensor(timestamp - self._ref_time)
             time_enc = self.time_encoder(delta_t)
-            msg_for_dst = self.msg_encoder(
-                m_src, m_dst, sign, time_enc, edge_weight
-            )
-            msg_for_src = self.msg_encoder(
-                m_dst, m_src, sign, time_enc, edge_weight
-            )
-            new_m_dst = self.updater(msg_for_dst, m_dst)
-            new_m_src = self.updater(msg_for_src, m_src)
-
-            self.memory.set_no_detach(dst, new_m_dst)
-            self.memory.set_no_detach(src, new_m_src)
+            msg_for_dst = self.msg_encoder(m_src, m_dst, sign, time_enc, edge_weight)
+            msg_for_src = self.msg_encoder(m_dst, m_src, sign, time_enc, edge_weight)
+            # Stack dst/src updates into one (2, memory_dim) GRUCell call.
+            msg_batch = torch.stack([msg_for_dst, msg_for_src])
+            mem_batch = torch.stack([m_dst, m_src])
+            new_mem = self.updater.gru(msg_batch, mem_batch)
+            self.memory.set_no_detach(dst, new_mem[0])
+            self.memory.set_no_detach(src, new_mem[1])
+            self._commit_edge(src, dst)
             self._ref_time = timestamp
+
+            if max_bptt_events > 0 and idx < len(events) and idx % max_bptt_events == 0:
+                self.detach_all_memory()
 
         return torch.stack(losses).mean()
 
     def detach_all_memory(self) -> None:
-        """Detach every stored memory tensor in place.
-
-        Called after ``loss.backward()`` and ``optimizer.step()`` to cut
-        the autograd graph at the step boundary so BPTT does not persist
-        across steps.
-        """
+        """Detach every stored memory tensor in place (cut BPTT at step end)."""
         for node_id in list(self.memory._store.keys()):
             v = self.memory._store[node_id]
             if v.requires_grad:
