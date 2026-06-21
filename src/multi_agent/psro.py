@@ -107,7 +107,7 @@ class PSROLoop:
         # ``train_step`` hook below). When None, TGN — if attached — stays
         # forward-only.
         self._tgn_optimizer = tgn_optimizer
-        self.last_step_stats: dict[str, int] = {
+        self.last_step_stats: dict[str, Any] = {
             "imputed": 0,
             "judged": 0,
             "scorable": 0,
@@ -569,36 +569,6 @@ class PSROLoop:
                 tgn.detach_all_memory()
                 self._graph.clear_nbr_mems_cache()
 
-        # Train the TGN's link head + message encoder + GRU updater on
-        # the judged events BEFORE extend, so memory propagation happens
-        # under autograd in train_step (not as a side effect of extend).
-        # This is the architectural hook that turns TGN from a passive
-        # observer into a co-trained reasoner.
-        tgn_loss: float = 0.0
-        if (
-            self._graph is not None
-            and self._graph._tgn is not None
-            and self._tgn_optimizer is not None
-            and judged.judged_pairs
-        ):
-            base_t = float(self._graph._edge_count) + 1.0
-            events: list[tuple[str, str, float, float, float, float]] = []
-            for i, ((u, v), y) in enumerate(judged.judged_pairs):
-                sign = 1.0 if y > 0 else (-1.0 if y < 0 else 0.0)
-                events.append(
-                    (u, v, sign, base_t + i, abs(float(y)), float(y))
-                )
-            self._tgn_optimizer.zero_grad()
-            loss = self._graph._tgn.train_step(events)
-            if loss.requires_grad:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self._graph._tgn.parameters(), max_norm=1.0
-                )
-                self._tgn_optimizer.step()
-            self._graph._tgn.detach_all_memory()
-            tgn_loss = float(loss.item())
-
         # Post-judge impute: now that q has its first neighborhood (from
         # the judged edges), re-impute any pairs we skipped for budget.
         score_by_pair, stats = self._impute_after_judge(
@@ -618,6 +588,11 @@ class PSROLoop:
             "sigma": self.sigma,
             "field_revealed": field_revealed,
             "tgn_loss": tgn_loss,
+            "tgn_link_loss": tgn_link_loss,
+            "tgn_align_loss": tgn_align_loss,
+            "auc_signed": _signed_auc_from_groups(auc_pos, auc_neg),
+            "auc_n_pos": len(auc_pos),
+            "auc_n_neg": len(auc_neg),
         }
         return self._results(query_ids, agents, batch.by_agent, score_by_pair, rewards)
 

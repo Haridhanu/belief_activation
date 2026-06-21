@@ -42,8 +42,10 @@ class MultiAgentConfig:
     # TGN integration: when use_tgn=True the TGN replaces the Bayesian
     # graph machinery. Agents continue to score (query, candidate) via
     # their attention + MLP heads, but `candidate_reps` come from the
-    # TGN's projected memory (instead of the signed-attention `_z`),
-    # and `Graph.impute` / `Graph.field` delegate to `tgn.predict_link`.
+    # TGN's projected memory (instead of the signed-attention `_z`).
+    # Warm `Graph.impute` / `Graph.field` delegate to `tgn.predict_link`;
+    # cold `raw_fallback` pairs use raw geometry only for field() and still
+    # defer impute() to the judge.
     # All defaults below are no-ops when use_tgn=False.
     use_tgn: bool = False
     tgn_memory_dim: int = 128
@@ -51,13 +53,28 @@ class MultiAgentConfig:
     tgn_n_attn_heads: int = 4
     tgn_lr: float = 1e-3
     tgn_predict_threshold: float = 0.2
+    # Auxiliary loss weight for aligning mem_to_emb(memory) with raw
+    # embedding coordinates. This keeps the TGN-backed candidate
+    # representation meaningful to agents whose query vectors still live in
+    # the original embedding space. The default is intentionally nonzero so
+    # TGN-backed BA trains mem_to_emb by default; set to 0.0 to disable.
+    # Applies only when use_tgn=True.
+    tgn_rep_align_weight: float = 0.05
 
-    # Cold-start handling — "pure" (option C) always uses
-    # mem_to_emb(memory) as the candidate representation, even when memory
-    # is all-zeros at session start. "raw_fallback" (option A) uses the
-    # raw embedding for nodes whose memory has not yet been touched by
-    # any event, then switches to projected memory once any event fires.
-    tgn_cold_start: str = "pure"
+    # Cold-start handling.
+    #
+    # "raw_fallback" (default) — use the raw embedding for nodes whose
+    #   memory has not yet been touched by any event, then switch to
+    #   ``mem_to_emb(memory)`` once any event fires for that node. Default
+    #   because it keeps cold nodes distinguishable from each other; the
+    #   alternative collapses every cold node to the same vector.
+    #
+    # "pure" — always use ``mem_to_emb(memory)``, including at cold start
+    #   when memory is all-zeros. Because ``mem_to_emb(0) == bias``, every
+    #   untouched node returns the SAME representation; downstream ranking
+    #   over an all-cold graph is degenerate. Only opt in when you intend
+    #   to warm memory before any ranking call.
+    tgn_cold_start: str = "raw_fallback"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MultiAgentConfig":
