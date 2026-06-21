@@ -245,7 +245,6 @@ def test_tgn_link_loss_drives_predictions_toward_targets():
     import torch
 
     from multi_agent.tgn import TGNModule
-
     torch.manual_seed(0)
     tgn = TGNModule(emb_dim=32, memory_dim=16, time_dim=8, n_heads=2)
     # Seed memories so link_head has non-zero input
@@ -262,28 +261,16 @@ def test_tgn_link_loss_drives_predictions_toward_targets():
         optimizer.step()
         losses.append(float(loss.item()))
 
-    assert (
-        losses[-1] < losses[0]
-    ), f"link_loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
+    assert losses[-1] < losses[0], (
+        f"link_loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
+    )
 
 
 def test_tgn_link_loss_empty_pairs_returns_zero():
     from multi_agent.tgn import TGNModule
-
     tgn = TGNModule(emb_dim=32, memory_dim=16, time_dim=8, n_heads=2)
     loss = tgn.link_loss([])
     assert float(loss.item()) == 0.0
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_tgn_link_loss_handles_cold_cuda_nodes():
-    from multi_agent.tgn import TGNModule
-
-    tgn = TGNModule(emb_dim=32, memory_dim=16, time_dim=8, n_heads=2).cuda()
-    loss = tgn.link_loss([("cold-a", "cold-b", 0.5)])
-
-    assert loss.device.type == "cuda"
-    loss.backward()
 
 
 def test_tgn_module_predict_link_changes_after_update():

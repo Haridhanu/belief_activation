@@ -49,21 +49,13 @@ class Graph:
     _z_index: dict[str, int] = field(default_factory=dict)
 
     _tgn: "TGNModule | None" = field(default=None, repr=False)
-    _nbr_mems_cache: dict[str, "torch.Tensor | None"] = field(
-        default_factory=dict, init=False, repr=False
-    )
-    _divergence_log: list[float] = field(default_factory=list, init=False, repr=False)
     _edge_count: int = field(default=0, init=False, repr=False)
     _edge_timestamps: dict[tuple[str, str], int] = field(
         default_factory=dict, init=False, repr=False
     )
-    # Cold-start mode for TGN substrate. "raw_fallback" (default) keeps
-    # cold nodes distinguishable by returning the raw embedding until
-    # memory is written for that node. "pure" always projects memory
-    # through ``mem_to_emb`` — under cold memory, every node returns the
-    # bias of ``mem_to_emb`` and ranking degenerates. See
-    # ``MultiAgentConfig.tgn_cold_start`` for the long form.
-    tgn_cold_start: str = field(default="raw_fallback", repr=False)
+    # Cold-start mode for TGN substrate: "pure" (always project memory)
+    # or "raw_fallback" (use raw embedding for nodes with no memory yet).
+    tgn_cold_start: str = field(default="pure", repr=False)
     # Confidence threshold for TGN-substrate impute() — below this, impute
     # returns None and the pair escalates to the judge.
     tgn_predict_threshold: float = field(default=0.2, repr=False)
@@ -94,6 +86,7 @@ class Graph:
         mem = self._tgn.memory.get(node_id)
         # NodeMemory.get returns zeros for unseen nodes; treat zeros as
         # "memory has not yet been touched" (cold start).
+        import torch
         return bool(torch.any(mem != 0.0).item())
 
     def _candidate_rep(self, node_id: str) -> np.ndarray:
@@ -113,32 +106,6 @@ class Graph:
         mem = self._tgn.get_memory([node_id])
         proj = self._tgn.project_to_emb(mem)
         return proj[0].detach().cpu().numpy().astype(np.float32)
-
-    def _tgn_raw_fallback_score(self, q: str, c: str) -> float | None:
-        """Raw-embedding cosine for cold TGN pairs in raw_fallback mode.
-
-        Cold TGN memories are all zeros, so ``predict_link(q, c)`` collapses
-        every cold pair to the same random-init score. In raw_fallback mode,
-        ``field`` uses raw embedding geometry until both endpoints have real
-        memory. ``impute`` does not use this score to create edges because raw
-        cosine cannot distinguish same-topic contradiction from coherence.
-        """
-        q_raw = self._raw.get(q)
-        c_raw = self._raw.get(c)
-        if q_raw is None or c_raw is None:
-            return None
-        q_norm = float(np.linalg.norm(q_raw))
-        c_norm = float(np.linalg.norm(c_raw))
-        if q_norm == 0.0 or c_norm == 0.0:
-            return 0.0
-        score = float(np.dot(q_raw, c_raw) / (q_norm * c_norm))
-        return float(max(-1.0, min(1.0, score)))
-
-    def _uses_tgn_raw_fallback(self, q: str, c: str) -> bool:
-        """Whether a pair should avoid TGN zero-memory prediction."""
-        if self._tgn is None or self.tgn_cold_start != "raw_fallback":
-            return False
-        return not (self._has_tgn_memory(q) and self._has_tgn_memory(c))
 
     def get_representations_fast(self, node_ids: list[str]) -> np.ndarray:
         """Batched read of per-node candidate representations.
@@ -214,17 +181,7 @@ class Graph:
         if self._tgn is not None:
             for v in touched:
                 if v in self._raw:
-                    new_rep = self._candidate_rep(v)
-                    self._z[v] = new_rep
-
-                    raw = self._raw[v][: self.emb_dim]
-                    denom = (np.linalg.norm(new_rep) * np.linalg.norm(raw)) + 1e-9
-                    cos_sim = float(np.dot(new_rep, raw) / denom)
-                    cos_dist = 1.0 - cos_sim
-                    if np.isfinite(cos_dist):
-                        self._divergence_log.append(float(cos_dist))
-                        if len(self._divergence_log) > 1000:
-                            del self._divergence_log[:-1000]
+                    self._z[v] = self._candidate_rep(v)
             return
 
         updates: dict[str, np.ndarray] = {}
@@ -262,41 +219,8 @@ class Graph:
 
     # --- imputation --------------------------------------------------------
 
-    def _nbr_mems(self, node_id: str) -> "torch.Tensor | None":
-        """Return stacked TGN memories for ``node_id``'s current neighbours.
-
-        Used to pass live structural context to :py:meth:`TGNModule.predict_link`
-        so predictions reflect the node's **current** graph neighbourhood,
-        not just its stored pairwise history.
-
-        Returns ``None`` when:
-        - No TGN is attached (Bayesian baseline mode).
-        - The node has no neighbours yet (cold node).
-        - The node is not in the graph.
-
-        The returned tensor has shape ``(n_neighbours, memory_dim)`` and is
-        on the TGN's device, ready to be passed directly to
-        :py:meth:`TGNModule.predict_link` as ``nbr_mems_src`` /
-        ``nbr_mems_dst``.
-        """
-        if self._tgn is None:
-            return None
-        if node_id in self._nbr_mems_cache:
-            return self._nbr_mems_cache[node_id]
-        neighbors = [nid for nid, _ in self.get_neighbors(node_id) if nid in self._raw]
-        if not neighbors:
-            self._nbr_mems_cache[node_id] = None
-            return None
-        nbr_mems = self._tgn.memory.get_batch(neighbors, device=self._tgn.device)
-        self._nbr_mems_cache[node_id] = nbr_mems
-        return nbr_mems
-
     def _prior(self, q: str, c: str) -> tuple[float, float, float]:
-        """Bayesian 2-hop posterior over the unobserved edge ``(q, c)``.
-
-        Returns ``(mu, var, data_precision)``. Used by :py:meth:`impute`
-        and :py:meth:`field` only when no TGN is attached, and by
-        :py:meth:`info_gain` (which is itself TGN-incompatible)."""
+        """Bayesian 2-hop posterior. Used only when no TGN is attached."""
         observed = self._edges.get(self._edge_key(q, c))
         if observed is not None:
             return observed, self.obs_variance, 1.0 / self.obs_variance
@@ -331,16 +255,7 @@ class Graph:
             return float(max(-1.0, min(1.0, observed)))
 
         if self._tgn is not None:
-            if self._uses_tgn_raw_fallback(q, c):
-                return None
-            score = float(
-                self._tgn.predict_link(
-                    q,
-                    c,
-                    nbr_mems_src=self._nbr_mems(q),
-                    nbr_mems_dst=self._nbr_mems(c),
-                )
-            )
+            score = float(self._tgn.predict_link(q, c))
             if abs(score) < self.tgn_predict_threshold:
                 return None
             return float(max(-1.0, min(1.0, score)))
@@ -362,23 +277,7 @@ class Graph:
         if observed is not None:
             return float(max(-1.0, min(1.0, observed)))
         if self._tgn is not None:
-            if self._uses_tgn_raw_fallback(q, c):
-                raw_score = self._tgn_raw_fallback_score(q, c)
-                return 0.0 if raw_score is None else raw_score
-            return float(
-                max(
-                    -1.0,
-                    min(
-                        1.0,
-                        self._tgn.predict_link(
-                            q,
-                            c,
-                            nbr_mems_src=self._nbr_mems(q),
-                            nbr_mems_dst=self._nbr_mems(c),
-                        ),
-                    ),
-                )
-            )
+            return float(max(-1.0, min(1.0, self._tgn.predict_link(q, c))))
         mu, _, _ = self._prior(q, c)
         return float(max(-1.0, min(1.0, mu)))
 

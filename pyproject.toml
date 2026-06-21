@@ -36,7 +36,9 @@ notebook = [
     "datasets>=4.8.5",
     "ipykernel>=6.0",
     "matplotlib>=3.7",
+    "networkx>=3.6.1",
     "pandas>=2.0",
+    "scikit-learn>=1.8.0",
     "sentence-transformers>=2.0",
 ]
 
