@@ -41,7 +41,7 @@ async def score_pairs(
     judge: Judge, pairs: list[tuple[str, str]], concurrency: int
 ) -> list[float]:
     """Score every pair. Uses ``judge.score_batch`` if the backend supports
-    fused batched inference (e.g. local NLI); otherwise fans out individual
+    fused batched inference (e.g. LocalLLMJudge); otherwise fans out individual
     ``score`` calls under a semaphore."""
     if not pairs:
         return []
@@ -86,9 +86,50 @@ def score_and_sample_agent(
         if col is not None:
             scores[qi, col] = float("-inf")
     probs = safe_softmax(scores, agent.temperature, dim=1)
-    indices = torch.multinomial(probs, k, replacement=False)  # (B, k)
-    proposals = [[pool_ids[j] for j in row] for row in indices.tolist()]
-    return AgentProposal(scores=scores, indices=indices, proposals=proposals)
+
+    # Sample per row over unmasked candidates only.
+    # A global-k multinomial call can draw the masked self-column in two cases:
+    #   (a) k >= valid count (multinomial falls back to zero-prob entries), and
+    #   (b) softmax underflow makes all valid probs zero on extreme logit gaps.
+    # Per-row sampling avoids both.  Rows with no valid candidates (singleton
+    # batch where pool == query) produce empty proposals without crashing.
+    row_indices: list[torch.Tensor] = []
+    proposals: list[list[str]] = []
+    for qi in range(scores.shape[0]):
+        valid_idx = (scores[qi] > float("-inf")).nonzero(as_tuple=False).squeeze(1)
+        if valid_idx.numel() == 0:
+            row_indices.append(torch.empty(0, dtype=torch.long, device=scores.device))
+            proposals.append([])
+            continue
+        row_k = min(k, valid_idx.numel())
+        valid_probs = probs[qi, valid_idx]
+        nonzero_count = int((valid_probs > 0).sum().item())
+        if nonzero_count < row_k:
+            # Partial or full softmax underflow: fewer non-zero entries than
+            # requested.  torch.multinomial(replacement=False) with more samples
+            # than non-zero entries silently draws zero-prob indices — behaviour
+            # PyTorch documents as invalid.  Fall back to uniform so every
+            # valid candidate is eligible and the constraint is always met.
+            valid_probs = valid_probs.new_ones(valid_probs.shape)
+        sampled = torch.multinomial(valid_probs, row_k, replacement=False)
+        global_idx = valid_idx[sampled]
+        row_indices.append(global_idx)
+        proposals.append([pool_ids[j] for j in global_idx.tolist()])
+
+    # Build a (B, k_eff) rectangular indices tensor for callers that still
+    # need a matrix (e.g. score lookup outside _backward).  k_eff is the
+    # minimum valid-candidate count across rows; _backward uses row_indices
+    # directly so it is not affected by rows with fewer than k candidates.
+    k_eff = min(t.numel() for t in row_indices)
+    if k_eff > 0:
+        indices = torch.stack([t[:k_eff] for t in row_indices])
+    else:
+        indices = torch.zeros(
+            (scores.shape[0], 0), dtype=torch.long, device=scores.device
+        )
+    return AgentProposal(
+        scores=scores, indices=indices, proposals=proposals, row_indices=row_indices
+    )
 
 
 def accumulate_pair_counts(

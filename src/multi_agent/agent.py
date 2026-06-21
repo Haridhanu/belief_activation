@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -235,3 +238,20 @@ class AgentPopulation:
 
     def embeddings_to_device(self, embeddings: np.ndarray) -> torch.Tensor:
         return torch.tensor(embeddings, dtype=torch.float32, device=self.device)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return a serialisable state dict keyed by agent_id."""
+        return {agent.agent_id: agent.state_dict() for agent in self.agents}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore agent parameters from a dict produced by :meth:`state_dict`."""
+        agent_by_id = {agent.agent_id: agent for agent in self.agents}
+        if set(state.keys()) != set(agent_by_id.keys()):
+            logging.getLogger(__name__).warning(
+                "AgentPopulation.load_state_dict: keys mismatch (state=%s, population=%s)",
+                sorted(state.keys()),
+                sorted(agent_by_id.keys()),
+            )
+        for agent_id, sd in state.items():
+            if agent_id in agent_by_id:
+                agent_by_id[agent_id].load_state_dict(sd)

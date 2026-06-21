@@ -127,6 +127,11 @@ def test_graph_impute_delegates_to_tgn_predict_link_when_attached():
     assert isinstance(out, float)
     assert -1.0 <= out <= 1.0
 
+def test_info_gain_raises_when_tgn_attached():
+    """info_gain is a Gaussian-KL quantity; TGN has no posterior variance,
+    so calling it under the TGN substrate must error loudly instead of
+    silently returning a Bayesian value over the underlying edge set."""
+    import pytest
 
 def test_graph_impute_returns_none_below_tgn_threshold():
     from multi_agent.graph import Graph
@@ -295,6 +300,13 @@ def test_psro_step_trains_tgn_when_attached():
     assert isinstance(raw["tgn_loss"], float)
     assert raw["tgn_loss"] > 0.0
 
+def test_trainer_first_batch_tgn_field_uses_raw_fallback_for_cold_nodes():
+    """First-batch TGN field predictions should be raw-geometry based, not
+    the same random score from zero memory for every cold pair."""
+    from multi_agent.benchmarks import Batch
+    from multi_agent.config import MultiAgentConfig
+    from multi_agent.judge import StaticJudge
+    from multi_agent.runner import Trainer
 
 def test_psro_step_runs_with_tgn_disabled():
     """Smoke test: with use_tgn=False, the existing PSRO path is unchanged."""

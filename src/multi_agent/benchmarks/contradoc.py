@@ -103,7 +103,7 @@ class ContraDoc(Benchmark):
         )
         candidates = self._rerank_by_proximity(anchor_id, candidates, edges)
         anchor = (query.metadata or {}).get("anchor_text", "")
-        # Dissonance prior from the graph — NLI has already scored
+        # Dissonance prior from the graph — the judge has already scored
         # every retrieved candidate against the anchor. Expose the
         # magnitude inline so the small answerer has a structural hint
         # to cross-check against its own reading.
@@ -118,7 +118,7 @@ class ContraDoc(Benchmark):
             f'ANCHOR CLAIM: "{anchor}"',
             "",
             "Numbered candidate sentences (ordered by proximity to the anchor). "
-            "``dissonance`` is an NLI-based prior: more negative = stronger "
+            "``dissonance`` is a judge-based prior: more negative = stronger "
             "contradiction signal. Use it as guidance, but verify by reading.",
         ]
         for n, (cid, text) in enumerate(candidates, start=1):
@@ -375,7 +375,7 @@ class ContraDoc(Benchmark):
                 return json.load(f)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         print(f"[ContraDoc] downloading {SOURCE_URL}")
-        with urllib.request.urlopen(SOURCE_URL) as resp:
+        with urllib.request.urlopen(SOURCE_URL, timeout=30) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         with open(cache, "w") as f:
             json.dump(payload, f)

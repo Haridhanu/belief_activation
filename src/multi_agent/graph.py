@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
+import torch
 
 if TYPE_CHECKING:
     from multi_agent.tgn import TGNModule
@@ -64,6 +65,10 @@ class Graph:
 
     def get_nodes(self) -> list[str]:
         return list(self._raw.keys())
+
+    @property
+    def tgn(self) -> "TGNModule | None":
+        return self._tgn
 
     def get_neighbors(self, node_id: str) -> list[tuple[str, float]]:
         if node_id not in self._raw:
@@ -152,8 +157,17 @@ class Graph:
                 touched.add(a)
                 touched.add(b)
         if touched:
+            self.clear_nbr_mems_cache()
             self._update_representations(touched)
             self._z_tensor = None
+
+    def clear_nbr_mems_cache(self) -> None:
+        self._nbr_mems_cache.clear()
+
+    def mean_representation_divergence(self) -> float:
+        if not self._divergence_log:
+            return 0.0
+        return float(np.mean(self._divergence_log))
 
     def _update_representations(self, touched: set[str]) -> None:
         """Refresh ``_z`` for touched nodes via signed attention.
@@ -267,7 +281,57 @@ class Graph:
         mu, _, _ = self._prior(q, c)
         return float(max(-1.0, min(1.0, mu)))
 
+    def impute_batch(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], float | None]:
+        """Batched :py:meth:`impute`. With a TGN attached, all warm pairs are
+        scored in a single ``tgn.predict_links`` call (one conv pass + one
+        link-head forward) instead of one forward per pair — the hot path in
+        ``PSROLoop._impute_after_judge``. Gating (observed edge, cold raw_fallback,
+        confidence threshold) matches :py:meth:`impute` exactly.
+        """
+        out: dict[tuple[str, str], float | None] = {}
+        if self._tgn is None:
+            for q, c in pairs:
+                out[(q, c)] = self.impute(q, c)
+            return out
+
+        tgn_pairs: list[tuple[str, str]] = []
+        for q, c in pairs:
+            if q == c:
+                out[(q, c)] = None
+                continue
+            observed = self._edges.get(self._edge_key(q, c))
+            if observed is not None:
+                out[(q, c)] = float(max(-1.0, min(1.0, observed)))
+                continue
+            if self._uses_tgn_raw_fallback(q, c):
+                out[(q, c)] = None
+                continue
+            tgn_pairs.append((q, c))
+
+        scores = self._tgn.predict_links(tgn_pairs)
+        for (q, c), score in zip(tgn_pairs, scores):
+            if abs(score) < self.tgn_predict_threshold:
+                out[(q, c)] = None
+            else:
+                out[(q, c)] = float(max(-1.0, min(1.0, score)))
+        return out
+
     def info_gain(self, q: str, c: str, y: float) -> float:
+        """KL between Bayesian prior and posterior over edge ``(q, c)``.
+
+        Only defined for the Bayesian baseline. The TGN substrate has no
+        notion of posterior variance, so a faithful Gaussian-KL value
+        cannot be computed — callers should use ``field`` and compute
+        surprisal themselves if they need a TGN-mode signal.
+        """
+        if self._tgn is not None:
+            raise NotImplementedError(
+                "Graph.info_gain is not defined for the TGN substrate "
+                "(no posterior variance). Use field()/predict_link and "
+                "compute surprisal externally."
+            )
         if self._edge_key(q, c) in self._edges:
             return 0.0
         mu0, var0, _ = self._prior(q, c)

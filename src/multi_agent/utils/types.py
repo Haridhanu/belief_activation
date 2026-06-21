@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import torch
@@ -11,8 +11,9 @@ class AgentProposal:
     """One agent's output for a batch of queries."""
 
     scores: torch.Tensor  # (B, N)
-    indices: torch.Tensor  # (B, k)
+    indices: torch.Tensor  # (B, k_eff) — rectangular, may be 0-wide
     proposals: list[list[str]]  # pool identifiers, one list per query
+    row_indices: list[torch.Tensor] = field(default_factory=list)  # ragged; len B
 
 
 @dataclass(frozen=True)
