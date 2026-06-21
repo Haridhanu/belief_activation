@@ -6,7 +6,6 @@ import numpy as np
 
 from multi_agent.graph import Graph
 
-
 EMB_DIM = 16
 
 

@@ -186,7 +186,7 @@ def make_synthetic_batches(
     are coherent (cosine ≈ +1), pairs across an opposing topic are
     contradictory (cosine ≈ -1), and pairs across unrelated topics are
     neutral (cosine ≈ 0). Use ``make_cosine_judge`` to reveal this
-    structure as the NLI-style signal.
+    structure as the entailment-style signal.
     """
     rng = np.random.default_rng(seed)
     n_topics = 2 * n_topic_pairs
@@ -311,6 +311,16 @@ def plot_coverage(step_history, ax=None):
     return ax
 
 
+def _iter_field_revealed_points(step_history):
+    for i, s in enumerate(step_history):
+        for item in s.field_revealed:
+            if isinstance(item, dict):
+                yield i, float(item["predicted"]), float(item["actual"])
+            else:
+                field_val, revealed = item
+                yield i, float(field_val), float(revealed)
+
+
 def plot_field_vs_revealed(step_history, ax=None):
     """Scatter of graph's pre-batch field prediction vs the judge's revealed
     score, colored by batch index. The diagonal is perfect prediction."""
@@ -319,11 +329,10 @@ def plot_field_vs_revealed(step_history, ax=None):
     xs: list[float] = []
     ys: list[float] = []
     batch_ix: list[int] = []
-    for i, s in enumerate(step_history):
-        for field_val, revealed in s.field_revealed:
-            xs.append(field_val)
-            ys.append(revealed)
-            batch_ix.append(i)
+    for i, field_val, revealed in _iter_field_revealed_points(step_history):
+        xs.append(field_val)
+        ys.append(revealed)
+        batch_ix.append(i)
     if ax is None:
         _, ax = plt.subplots(figsize=(5, 5))
     if xs:
@@ -346,9 +355,7 @@ def animate_field_vs_revealed(step_history, interval: int = 500):
     from IPython.display import HTML
     from matplotlib.animation import FuncAnimation
 
-    points = [
-        (i, f, r) for i, s in enumerate(step_history) for f, r in s.field_revealed
-    ]
+    points = list(_iter_field_revealed_points(step_history))
 
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
     ax.set_xlim(-1.05, 1.05)
@@ -420,14 +427,24 @@ def plot_belief_graph(graph, node_texts=None, *, ax=None, seed: int = 0, title=N
     if pos_edges:
         widths = [0.6 + 2.4 * abs(G[u][v]["weight"]) for u, v in pos_edges]
         nx.draw_networkx_edges(
-            G, pos, edgelist=pos_edges, edge_color="#27ae60",
-            width=widths, alpha=0.55, ax=ax,
+            G,
+            pos,
+            edgelist=pos_edges,
+            edge_color="#27ae60",
+            width=widths,
+            alpha=0.55,
+            ax=ax,
         )
     if neg_edges:
         widths = [0.6 + 2.4 * abs(G[u][v]["weight"]) for u, v in neg_edges]
         nx.draw_networkx_edges(
-            G, pos, edgelist=neg_edges, edge_color="#c0392b",
-            width=widths, alpha=0.7, ax=ax,
+            G,
+            pos,
+            edgelist=neg_edges,
+            edge_color="#c0392b",
+            width=widths,
+            alpha=0.7,
+            ax=ax,
         )
     ax.set_axis_off()
     ax.set_title(

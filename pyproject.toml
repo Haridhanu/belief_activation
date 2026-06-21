@@ -7,8 +7,15 @@ dependencies = [
     "numpy>=1.26",
     "pyyaml>=6.0",
     "torch>=2.0",
-    "transformers>=4.40",
+    "transformers>=4.51",
+    "accelerate>=0.26",
     "google-genai>=0.3",
+    "torch-geometric>=2.8.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "bitsandbytes>=0.41",
 ]
 
 [build-system]
@@ -19,7 +26,12 @@ build-backend = "hatchling.build"
 packages = ["src/multi_agent"]
 
 [dependency-groups]
-dev = ["pytest>=7.0"]
+dev = [
+    "fakeredis>=2.36.2",
+    "lupa>=2.8",
+    "pytest>=7.0",
+    "pytest-asyncio>=1.4.0",
+]
 notebook = [
     "datasets>=4.8.5",
     "ipykernel>=6.0",
@@ -30,3 +42,5 @@ notebook = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
