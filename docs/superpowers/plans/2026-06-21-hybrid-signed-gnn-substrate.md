@@ -28,8 +28,7 @@
 - Create `src/multi_agent/signed_gnn.py` — `SignedGNN` module (encoder + link head). One responsibility: signed multi-hop link scoring + node embeddings.
 - Modify `src/multi_agent/config.py` — add `graph_substrate`, `signed_gnn_*`, `hybrid_density_threshold`.
 - Modify `src/multi_agent/graph.py` — add `_sgnn` field, degree gate, hybrid `field/impute/impute_batch`, `_candidate_rep` for Signed-GNN.
-- Modify `src/multi_agent/runner.py` — `Trainer.__init__` constructs the substrate from `config.graph_substrate`.
-- Modify `src/multi_agent/psro.py` — fit the Signed-GNN on committed edges after extend (hook parallel to the TGN one).
+- Modify `src/multi_agent/runner.py` — `Trainer.__init__` constructs the substrate from `config.graph_substrate`; `Trainer.step` refits the Signed-GNN on committed edges after `extend` (hook parallel to the TGN one). (`psro.py` is unchanged for `signed_hybrid`.)
 - Create `tests/test_signed_gnn.py`, `tests/test_hybrid_substrate.py`.
 
 **Phase 2 — `~/dyssonance-backend/research_deployment/belief_activation`:** mirror of the above files; plus `perseverate_api/belief_activation.py` (config wiring) + root `pyproject.toml` (`torch-geometric`).
@@ -508,33 +507,86 @@ git commit -m "test(hybrid): signed substrate beats Bayesian on dense held-out; 
 
 > Mirrors Phase 1 under `research_deployment/belief_activation/` and wires backend config.
 
-### Task 7: Copy substrate files into the vendored package
+### Task 7: Diff-and-reconcile the substrate into the vendored package
 
-- [ ] **Step 1: Copy the changed files** (overwrite vendored with Phase-1 versions)
+> **DO NOT blind-copy.** The backend's vendored `multi_agent` is a living, diverging
+> copy (this is what caused the earlier botched merge). `signed_gnn.py` is a clean
+> NEW file (safe to copy), but `config.py`/`graph.py`/`runner.py` must have *only the
+> substrate additions* applied on top of whatever the backend currently has.
+> (Phase 1 did not change `psro.py` for `signed_hybrid` — the refit lives in
+> `runner.py` — so do not touch the backend's `psro.py`.)
+
+- [ ] **Step 1: Assess divergence** (record what differs before editing)
 
 ```bash
 cd ~/belief_activation
 B=~/dyssonance-backend/research_deployment/belief_activation
+for f in config.py graph.py runner.py; do
+  echo "=== $f ==="; diff -u "$B/src/multi_agent/$f" "src/multi_agent/$f" | head -80
+done
+test -f "$B/src/multi_agent/signed_gnn.py" && echo "WARN: signed_gnn.py already exists in backend" || echo "signed_gnn.py is new (clean add)"
+```
+Expected: the only *intended* diffs are the substrate additions from Tasks 1–5 (config
+fields, `_sgnn*` graph fields/methods + field/impute branches, runner construct/refit).
+Anything else in the diff is pre-existing backend divergence — **leave it as the backend has it.**
+
+- [ ] **Step 2: Clean-add the new file**
+
+```bash
 cp src/multi_agent/signed_gnn.py "$B/src/multi_agent/signed_gnn.py"
-for f in config.py graph.py runner.py; do cp src/multi_agent/$f "$B/src/multi_agent/$f"; done
 cp tests/test_signed_gnn.py tests/test_hybrid_substrate.py "$B/tests/"
 ```
 
-- [ ] **Step 2: Add `torch-geometric` to backend deps**
+- [ ] **Step 3: Apply the `config.py` additions** to the backend's `config.py` (do NOT overwrite)
 
-Edit `~/dyssonance-backend/research_deployment/belief_activation/pyproject.toml` → add `"torch-geometric>=2.4"` to `dependencies`. Also add it to the backend root `pyproject.toml` if the workspace pins deps there (search: `grep -n torch-geometric ~/dyssonance-backend/pyproject.toml`).
+Open `$B/src/multi_agent/config.py`, find the `tgn_cold_start` field in `MultiAgentConfig`,
+and insert *after it* the exact block from Task 3:
 
-- [ ] **Step 3: Sync + run the vendored package tests**
+```python
+    graph_substrate: str = "bayesian"
+    signed_gnn_hidden: int = 32
+    signed_gnn_layers: int = 3
+    signed_gnn_lr: float = 1e-2
+    signed_gnn_epochs: int = 200
+    hybrid_density_threshold: int = 6
+```
 
-Run: `cd ~/dyssonance-backend && uv sync && uv run pytest research_deployment/belief_activation/tests/test_signed_gnn.py research_deployment/belief_activation/tests/test_hybrid_substrate.py -q`
-Expected: PASS
+- [ ] **Step 4: Apply the `graph.py` additions** to the backend's `graph.py` (do NOT overwrite)
 
-- [ ] **Step 4: Commit** (in dyssonance-backend, on a feature branch)
+In the `Graph` dataclass, add the fields from Task 4 (next to `_tgn`):
+`_sgnn`, `hybrid_density_threshold`, `_sgnn_index`, `_sgnn_features`. Then add the methods
+`_degree`, `_hybrid_use_signed`, `_sgnn_predict` (Task 4 code), and insert the Signed-GNN
+branch into `field` and `impute` *before* the existing Bayesian/`_prior` block and after the
+observed-edge short-circuit (Task 4 snippet). Leave the existing `_tgn` branches untouched.
+
+- [ ] **Step 5: Apply the `runner.py` additions** to the backend's `runner.py` (do NOT overwrite)
+
+In `Trainer.__init__`, after the TGN-construction block, add the `signed_hybrid` construction
+(Task 5). Add the `_refit_signed_gnn` method (Task 5). In `Trainer.step`, after
+`self.graph.extend(batch.ids, batch.embs, edges)`, add the `signed_hybrid` refit call (Task 5).
+
+- [ ] **Step 6: Add `torch-geometric` to backend deps**
+
+Edit `$B/pyproject.toml` → add `"torch-geometric>=2.4"` to `dependencies`. If the workspace
+pins deps at the root, add it there too: `grep -n "torch-geometric\|torch_geometric" ~/dyssonance-backend/pyproject.toml`.
+
+- [ ] **Step 7: Sync + run the vendored package's FULL suite** (catch reconcile regressions)
+
+Run:
+```bash
+cd ~/dyssonance-backend && uv sync
+uv run pytest research_deployment/belief_activation/tests -q -m "not heavy"
+```
+Expected: all pre-existing vendored tests pass (default substrate unchanged) **plus** the new
+`test_signed_gnn.py` / `test_hybrid_substrate.py`. If any pre-existing test fails, the
+reconcile touched something it shouldn't — revert that edit and re-apply additively.
+
+- [ ] **Step 8: Commit** (in dyssonance-backend, on a feature branch)
 
 ```bash
 cd ~/dyssonance-backend && git checkout -b feat/signed-hybrid-substrate
 git add research_deployment/belief_activation pyproject.toml
-git commit -m "feat(belief_activation): vendor Signed-GNN hybrid substrate"
+git commit -m "feat(belief_activation): vendor Signed-GNN hybrid substrate (additive reconcile)"
 ```
 
 ### Task 8: Wire substrate selection into backend belief activation
