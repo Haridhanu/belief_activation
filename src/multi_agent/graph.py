@@ -68,6 +68,15 @@ class Graph:
     # returns None and the pair escalates to the judge.
     tgn_predict_threshold: float = field(default=0.2, repr=False)
 
+    # Signed-GNN hybrid substrate. _sgnn is a SignedGNN (attached by Trainer when
+    # graph_substrate="signed_hybrid"); a pair uses it only when BOTH endpoints'
+    # degree >= hybrid_density_threshold, else falls back to the Bayesian posterior.
+    # _sgnn_index maps node_id -> row in _sgnn_features (set by Trainer after fit).
+    _sgnn: "object | None" = field(default=None, repr=False)
+    hybrid_density_threshold: int = field(default=6, repr=False)
+    _sgnn_index: "dict[str, int] | None" = field(default=None, repr=False)
+    _sgnn_features: "np.ndarray | None" = field(default=None, repr=False)
+
     def __len__(self) -> int:
         return len(self._raw)
 
@@ -139,6 +148,28 @@ class Graph:
         if self._tgn is None or self.tgn_cold_start != "raw_fallback":
             return False
         return not (self._has_tgn_memory(q) and self._has_tgn_memory(c))
+
+    # --- signed-GNN hybrid substrate ---------------------------------------
+
+    def _degree(self, node_id: str) -> int:
+        return len(self._adj.get(node_id, ()))
+
+    def _hybrid_use_signed(self, q: str, c: str) -> bool:
+        """True iff a Signed-GNN is attached AND both endpoints are dense."""
+        if self._sgnn is None:
+            return False
+        return (
+            self._degree(q) >= self.hybrid_density_threshold
+            and self._degree(c) >= self.hybrid_density_threshold
+        )
+
+    def _sgnn_predict(self, q: str, c: str) -> float | None:
+        """Signed-GNN score for (q, c), or None if it can't be computed yet."""
+        idx = self._sgnn_index
+        if idx is None or self._sgnn_features is None or q not in idx or c not in idx:
+            return None
+        out = self._sgnn.predict(self._sgnn_features, [(idx[q], idx[c])])
+        return out.get((idx[q], idx[c]))
 
     def get_representations_fast(self, node_ids: list[str]) -> np.ndarray:
         """Batched read of per-node candidate representations.
@@ -330,6 +361,13 @@ class Graph:
         if observed is not None:
             return float(max(-1.0, min(1.0, observed)))
 
+        # Signed-GNN hybrid: use it only for dense pairs; sparse pairs fall
+        # through to the Bayesian posterior below.
+        if self._hybrid_use_signed(q, c):
+            score = self._sgnn_predict(q, c)
+            if score is not None:
+                return float(max(-1.0, min(1.0, score)))
+
         if self._tgn is not None:
             if self._uses_tgn_raw_fallback(q, c):
                 return None
@@ -361,6 +399,11 @@ class Graph:
         observed = self._edges.get(self._edge_key(q, c))
         if observed is not None:
             return float(max(-1.0, min(1.0, observed)))
+        # Signed-GNN hybrid: dense pairs only; sparse fall through to Bayesian.
+        if self._hybrid_use_signed(q, c):
+            score = self._sgnn_predict(q, c)
+            if score is not None:
+                return float(max(-1.0, min(1.0, score)))
         if self._tgn is not None:
             if self._uses_tgn_raw_fallback(q, c):
                 raw_score = self._tgn_raw_fallback_score(q, c)

@@ -198,6 +198,16 @@ class Trainer:
         self.tgn = tgn
         self.tgn_optimizer = tgn_optimizer
 
+        if config.graph_substrate == "signed_hybrid":
+            from multi_agent.signed_gnn import SignedGNN
+
+            self.graph._sgnn = SignedGNN(
+                in_dim=config.emb_dim,
+                hidden=config.signed_gnn_hidden,
+                layers=config.signed_gnn_layers,
+            ).to(torch.device(config.device))
+            self.graph.hybrid_density_threshold = config.hybrid_density_threshold
+
         self.loop = PSROLoop(
             config, judge=judge, graph=self.graph, tgn_optimizer=tgn_optimizer
         )
@@ -245,6 +255,9 @@ class Trainer:
         n_coh = sum(1 for _, _, w in edges if w > 0)
         n_dis = sum(1 for _, _, w in edges if w < 0)
         self.graph.extend(batch.ids, batch.embs, edges)
+
+        if self.config.graph_substrate == "signed_hybrid" and self.graph._sgnn is not None:
+            self._refit_signed_gnn()
 
         raw = self.loop.last_step_stats
         field_revealed = list(raw.get("field_revealed", []))
@@ -308,6 +321,28 @@ class Trainer:
             edges=edges,
             stats=stats,
         )
+
+    def _refit_signed_gnn(self) -> None:
+        """Refit the Signed-GNN on all committed signed edges and refresh the
+        graph's id->row index + raw feature matrix used by ``_sgnn_predict``."""
+        node_ids = self.graph.get_nodes()
+        if not node_ids:
+            return
+        idx = {nid: i for i, nid in enumerate(node_ids)}
+        feats = np.stack([self.graph._raw[nid][: self.config.emb_dim] for nid in node_ids])
+        edges = [
+            (idx[a], idx[b], float(w))
+            for (a, b), w in self.graph._edges.items()
+            if a in idx and b in idx
+        ]
+        self.graph._sgnn.fit(
+            feats,
+            edges,
+            epochs=self.config.signed_gnn_epochs,
+            lr=self.config.signed_gnn_lr,
+        )
+        self.graph._sgnn_index = idx
+        self.graph._sgnn_features = feats
 
     def stream(
         self, batches: Iterable[Batch], sink: EdgeSink | None = None

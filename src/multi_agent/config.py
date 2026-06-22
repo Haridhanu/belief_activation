@@ -76,6 +76,20 @@ class MultiAgentConfig:
     #   to warm memory before any ranking call.
     tgn_cold_start: str = "raw_fallback"
 
+    # Graph substrate for link prediction / candidate reps:
+    #   "bayesian" (default) — closed-form 2-hop Gaussian posterior.
+    #   "tgn"               — legacy temporal graph network (memory + 1-hop).
+    #   "signed_hybrid"     — balance-theory signed multi-hop GNN, used once a
+    #                         pair is dense (both endpoints' degree >=
+    #                         hybrid_density_threshold); falls back to the
+    #                         Bayesian posterior while sparse.
+    graph_substrate: str = "bayesian"
+    signed_gnn_hidden: int = 32
+    signed_gnn_layers: int = 3
+    signed_gnn_lr: float = 1e-2
+    signed_gnn_epochs: int = 200
+    hybrid_density_threshold: int = 6
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MultiAgentConfig":
 
