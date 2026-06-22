@@ -1,0 +1,80 @@
+{
+ "n_nodes": 28,
+ "n_scenarios": 4,
+ "summary": {
+  "cosine": {
+   "mean_R_rank": 5.25,
+   "above_traps_pct": 25.0
+  },
+  "bayes": {
+   "mean_R_rank": 14.5,
+   "above_traps_pct": 0.0
+  },
+  "tgn": {
+   "mean_R_rank": 18.25,
+   "above_traps_pct": 25.0
+  }
+ },
+ "detail": [
+  {
+   "scenario": "attribution_bias_corporate_deal-missed-sales",
+   "cosine": {
+    "R_rank": 6,
+    "above_traps": false
+   },
+   "bayes": {
+    "R_rank": 10,
+    "above_traps": false
+   },
+   "tgn": {
+    "R_rank": 12,
+    "above_traps": false
+   }
+  },
+  {
+   "scenario": "conflict_avoidance_corporate_failed-launch",
+   "cosine": {
+    "R_rank": 3,
+    "above_traps": false
+   },
+   "bayes": {
+    "R_rank": 13,
+    "above_traps": false
+   },
+   "tgn": {
+    "R_rank": 22,
+    "above_traps": false
+   }
+  },
+  {
+   "scenario": "learned_helplessness_corporate_missed-opportunity",
+   "cosine": {
+    "R_rank": 10,
+    "above_traps": false
+   },
+   "bayes": {
+    "R_rank": 7,
+    "above_traps": false
+   },
+   "tgn": {
+    "R_rank": 22,
+    "above_traps": true
+   }
+  },
+  {
+   "scenario": "impostor_syndrome_corporate_missed-deadlines-cycle",
+   "cosine": {
+    "R_rank": 2,
+    "above_traps": true
+   },
+   "bayes": {
+    "R_rank": 28,
+    "above_traps": false
+   },
+   "tgn": {
+    "R_rank": 17,
+    "above_traps": false
+   }
+  }
+ ]
+}
